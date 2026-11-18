@@ -344,7 +344,7 @@ def subtract_missing_processes(state: ServerState, values: dict) -> None:
 
 
 def build_processes(state: ServerState, values: dict, rng: random.Random) -> list[dict]:
-    """Топ-5 процесів за CPU з урахуванням зупинених служб і змін від сценаріїв."""
+    """Топ-5 процесів за CPU + топ-5 за RAM з урахуванням зупинених служб і змін від сценаріїв."""
     total = values["cpu_pct"]
     procs = []
     for p in state.profile["processes"]:
@@ -382,8 +382,10 @@ def build_processes(state: ServerState, values: dict, rng: random.Random) -> lis
                 proc["cpu_pct"] *= factor
     for proc in procs:
         proc["cpu_pct"] = min(proc["cpu_pct"], total)
-    procs.sort(key=lambda pr: pr["cpu_pct"], reverse=True)
-    return procs[:5]
+    # Як у агента: топ-5 за CPU і топ-5 за RAM, без повторів
+    top_cpu = sorted(procs, key=lambda pr: pr["cpu_pct"], reverse=True)[:5]
+    top_ram = sorted(procs, key=lambda pr: pr["ram_mb"], reverse=True)[:5]
+    return top_cpu + [p for p in top_ram if p not in top_cpu]
 
 
 # ---------------------------------------------------------------------------
@@ -411,14 +413,27 @@ INSERT_SQL = {
 }
 
 
+def build_inventory(prof: dict) -> str:
+    """Інвентар сервера в тому вигляді, який збере справжній агент:
+    сайти з пулами (appcmd list app) і служби з exe (Win32_Service)."""
+    inventory = {
+        "sites": [{"name": s["name"], "app_pool": s["app_pool"]} for s in prof.get("sites", [])],
+        "services": [{"name": s["name"], "exe": s["exe"]} for s in prof["services"] if s["kind"] == "service"],
+    }
+    return json.dumps(inventory, ensure_ascii=False)
+
+
 def ensure_servers(profiles: dict) -> dict[str, int]:
-    """Створює записи серверів sim-* (якщо їх немає) і повертає {назва: id}."""
+    """Створює записи серверів sim-* (якщо їх немає), оновлює опис та інвентар
+    і повертає {назва: id}."""
     ids = {}
     with db_session() as conn:
         for name, prof in profiles["servers"].items():
             conn.execute("INSERT OR IGNORE INTO servers (name, kind, description) VALUES (?, 'sim', ?)",
                          (name, prof["description"]))
-            conn.execute("UPDATE servers SET description = ? WHERE name = ?", (prof["description"], name))
+            conn.execute("UPDATE servers SET description = ?, inventory_json = ?, inventory_updated_at = ? "
+                         "WHERE name = ?",
+                         (prof["description"], build_inventory(prof), fmt(datetime.now(timezone.utc)), name))
             ids[name] = conn.execute("SELECT id FROM servers WHERE name = ?", (name,)).fetchone()["id"]
     return ids
 
@@ -548,8 +563,8 @@ class Simulation:
                 self.buffers["service_status"].append((ts, sid, svc["name"], svc["kind"], status))
                 self.last_status[name][svc["name"]] = status
 
-        # 10. Теки — щогодини
-        if minute_index % 60 == 0:
+        # 10. Теки — раз на 5 хв
+        if minute_index % 5 == 0:
             for path, size in state.folder_gb.items():
                 self.buffers["folder_sizes"].append((ts, sid, path, round(size, 2)))
 
@@ -1174,7 +1189,7 @@ def incident_details(incident_id: int) -> None:
         before_ts, before = snapshot(fmt(parse(start) - timedelta(hours=1)))
         peak_ts, top = snapshot(peak, not_before=start)
         before_by_key = {(p["name"], p["app_pool"]): p for p in before}
-        print(f"\n[Топ-5 процесів на піку (знімок {local(peak_ts) if peak_ts else '—'}) "
+        print(f"\n[Процеси на піку — топ-5 CPU + топ-5 RAM (знімок {local(peak_ts) if peak_ts else '—'}) "
               f"проти години до інциденту (знімок {local(before_ts) if before_ts else '—'})]")
         print(f"  {'процес':<16}{'пул':<10}{'PID':>7}{'CPU, %':>9}{'(до)':>7}{'RAM, МБ':>10}{'(до)':>9}")
         for p in top:
@@ -1194,9 +1209,9 @@ def incident_details(incident_id: int) -> None:
             " MAX(size_gb) AS max_gb "
             "FROM folder_sizes f WHERE server_id=? AND ts>=? AND ts<? GROUP BY path",
             (start, sid, start, end)).fetchall()
-        print("\n[Теки: приріст під час інциденту (знімки щогодини)]")
+        print("\n[Теки: приріст під час інциденту (знімки раз на 5 хв)]")
         if not folders:
-            print("  інцидент коротший за годину — погодинних знімків тек у ньому немає")
+            print("  у вікні інциденту немає знімків тек")
         growth = sorted(((f["path"], f["before_gb"] or 0, f["max_gb"]) for f in folders),
                         key=lambda x: x[2] - x[1], reverse=True)
         for path, before_gb, max_gb in growth[:3]:

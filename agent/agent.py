@@ -169,13 +169,16 @@ def collect_sample() -> dict[str, list[dict]]:
             "ram_mb": round(ram_mb, 1),
             "app_pool": _app_pool_name(proc),
         })
-    # Сортуємо за CPU, а за рівного CPU — за пам'яттю
-    process_rows.sort(key=lambda row: (row["cpu_pct"], row["ram_mb"]), reverse=True)
+    # Топ-5 за CPU і топ-5 за RAM, без повторів: так у знімок потрапляє
+    # і процес, що вантажить процесор, і процес, у якого росте пам'ять
+    top_cpu = sorted(process_rows, key=lambda row: row["cpu_pct"], reverse=True)[:TOP_PROCESSES]
+    top_ram = sorted(process_rows, key=lambda row: row["ram_mb"], reverse=True)[:TOP_PROCESSES]
+    top = top_cpu + [row for row in top_ram if row not in top_cpu]
 
     return {
         "metrics": [metrics_row],
         "disk_usage": collect_disk_usage(ts),
-        "process_snapshots": process_rows[:TOP_PROCESSES],
+        "process_snapshots": top,
     }
 
 
@@ -208,7 +211,7 @@ def print_sample(sample: dict[str, list[dict]]) -> None:
     for d in sample["disk_usage"]:
         print(f"  {d['drive']:<6}{d['used_pct']:>12}{d['free_gb']:>12}{d['total_gb']:>12}")
 
-    print(f"\n[process_snapshots] топ-{TOP_PROCESSES} за CPU")
+    print(f"\n[process_snapshots] топ-{TOP_PROCESSES} за CPU + топ-{TOP_PROCESSES} за RAM")
     print(f"  {'Процес':<28}{'PID':>8}{'CPU, %':>9}{'RAM, МБ':>10}  Пул IIS")
     for p in sample["process_snapshots"]:
         print(f"  {p['name'][:27]:<28}{p['pid']:>8}{p['cpu_pct']:>9}{p['ram_mb']:>10}  {_fmt(p['app_pool'])}")

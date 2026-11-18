@@ -44,12 +44,18 @@ servers:
         weekday_gb_per_day: 0.02
         weekend_gb_per_day: 0.02
 
+    # Служби (exe — як у Win32_Service.PathName) і пули IIS
     services:
-      - {name: W3SVC, kind: service}
-      - {name: WAS, kind: service}
-      - {name: PortalSyncService, kind: service}
+      - {name: W3SVC, kind: service, exe: svchost.exe}
+      - {name: WAS, kind: service, exe: svchost.exe}
+      - {name: PortalSyncService, kind: service, exe: PortalSync.exe}
       - {name: SitePool, kind: apppool}
       - {name: ApiPool, kind: apppool}
+
+    # Сайти IIS і їхні пули (як у appcmd list app)
+    sites:
+      - {name: portal.example.com, app_pool: SitePool}
+      - {name: api.example.com, app_pool: ApiPool}
 
     # cpu_share — частка загального CPU сервера, яку займає процес
     processes:
@@ -127,9 +133,9 @@ servers:
         weekend_gb_per_day: 0.02
 
     services:
-      - {name: MSSQLSERVER, kind: service}
-      - {name: SQLSERVERAGENT, kind: service}
-      - {name: SQLWriter, kind: service}
+      - {name: MSSQLSERVER, kind: service, exe: sqlservr.exe}
+      - {name: SQLSERVERAGENT, kind: service, exe: SQLAGENT.EXE}
+      - {name: SQLWriter, kind: service, exe: sqlwriter.exe}
 
     processes:
       - {name: sqlservr.exe, service: MSSQLSERVER, cpu_share: 0.75, ram_mb: 48000}

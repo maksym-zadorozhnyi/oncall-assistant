@@ -9,6 +9,8 @@ erDiagram
         TEXT name
         TEXT kind
         TEXT description
+        TEXT inventory_json
+        TEXT inventory_updated_at
     }
     metrics {
         TEXT ts

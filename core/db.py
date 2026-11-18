@@ -30,10 +30,14 @@ SCHEMA = """
 -- ===== Сирі дані (пишуть агент, симулятор, імпорт CSV) =====
 
 CREATE TABLE IF NOT EXISTS servers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,           -- наприклад sim-1, my-pc
-    kind        TEXT NOT NULL CHECK (kind IN ('real', 'sim')),
-    description TEXT
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                 TEXT NOT NULL UNIQUE,  -- наприклад sim-1, my-pc
+    kind                 TEXT NOT NULL CHECK (kind IN ('real', 'sim')),
+    description          TEXT,
+    -- Інвентар сервера: сайт -> пул IIS (appcmd list app) і служба -> exe
+    -- (Win32_Service). Лише поточний стан, без історії
+    inventory_json       TEXT,
+    inventory_updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
