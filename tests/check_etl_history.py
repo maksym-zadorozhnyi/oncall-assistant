@@ -171,8 +171,11 @@ def main() -> None:
         lines += ["", "### Падіння зайнятості D: на sim-1 — сходинка, не викид", "",
                   "Щотижневе прибирання логів IIS (неділя 01:00 UTC) і «прибирання» "
                   "наприкінці `disk_fill`; знайдено з даних (падіння > 1 п. п. за хвилину).", "",
-                  "| Час прибирання (UTC) | Було → стало, % | Викидів ±1 год (усі показники) |",
-                  "|---|---|---|"]
+                  "Перевіряємо показники диска D: (`disk_used_pct:D:`, `disk_free_gb:D:`). "
+                  "Викиди інших показників у тому ж вікні — збіг у часі (наприклад, фоновий "
+                  "сплеск CPU), їх показано окремо.", "",
+                  "| Час прибирання (UTC) | Було → стало, % | Викидів D: ±1 год | "
+                  "Інші викиди ±1 год (збіг) |", "|---|---|---|---|"]
         sid1 = next(i for i, n in servers.items() if n == "sim-1")
         d = pd.read_sql_query("SELECT ts, value FROM metrics_clean WHERE server_id = ? "
                               "AND metric = 'disk_used_pct:D:' ORDER BY ts", conn, params=[sid1])
@@ -180,9 +183,15 @@ def main() -> None:
         drops = d[d["value"].diff() < -1]
         for _, row in drops.iterrows():
             prev = d.loc[row.name - 1, "value"]
-            n, out = outliers_between(conn, sid1, "%", row["ts"] - pd.Timedelta(hours=1),
-                                      row["ts"] + pd.Timedelta(hours=1))
-            lines.append(f"| {row['ts']:%Y-%m-%d %H:%M} | {prev:.1f} → {row['value']:.1f} | {out} |")
+            w0, w1 = row["ts"] - pd.Timedelta(hours=1), row["ts"] + pd.Timedelta(hours=1)
+            out = sum(outliers_between(conn, sid1, m, w0, w1)[1]
+                      for m in ("disk_used_pct:D:", "disk_free_gb:D:"))
+            other = conn.execute("SELECT metric, COUNT(*) n FROM metrics_clean WHERE server_id = ? "
+                                 "AND is_outlier = 1 AND ts >= ? AND ts < ? GROUP BY metric",
+                                 (sid1, w0.strftime(etl.TS_FORMAT), w1.strftime(etl.TS_FORMAT))).fetchall()
+            other_text = ", ".join(f"`{o['metric']}`: {o['n']}" for o in other) or "—"
+            lines.append(f"| {row['ts']:%Y-%m-%d %H:%M} | {prev:.1f} → {row['value']:.1f} | {out} | "
+                         f"{other_text} |")
             checks.append((f"Після прибирання D: {row['ts']:%d.%m %H:%M} викидів немає", out == 0,
                            f"{out} викидів"))
 

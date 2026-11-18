@@ -61,7 +61,7 @@ def fmt(t: datetime) -> str:
 # Параметри сценарію, які зберігаються в sim_incidents.params_json
 # (службові проміжні значення сценаріїв — швидкість росту тощо — не зберігаємо)
 PARAM_KEYS = ["process", "app_pool", "service", "pool", "drive", "folder",
-              "variant", "reason", "duration_min", "fill_minutes"]
+              "variant", "reason", "cause", "duration_min", "fill_minutes"]
 
 
 def fmt_duration(minutes: int) -> str:
@@ -119,6 +119,9 @@ class ServerState:
         self.last_backup_ok = True
         self.backup_fail_next = False
         self.backup_running_until: datetime | None = None
+        # True, поки «зламано» видалення старих файлів (disk_fill з cause=retention_stopped):
+        # не працюють щотижневе прибирання логів IIS і видалення старих бекапів
+        self.retention_stopped = False
 
         # Короткий сплеск CPU (не інцидент)
         self.burst_left = 0
@@ -171,10 +174,22 @@ class ServerState:
     def drive_used_pct(self, drive: str) -> float:
         return 100 * self.drive_used_gb(drive) / self.drive_total_gb(drive)
 
+    def clean_folder(self, folder: dict) -> None:
+        """Прибирання теки з weekly_cleanup: лишається keep_gb найсвіжіших файлів."""
+        path = folder["path"]
+        self.folder_gb[path] = min(self.folder_gb[path], folder["weekly_cleanup"]["keep_gb"])
+
     # --- бекапи ---
     def sync_backup_folder(self) -> None:
         b = self.profile["backup"]
         self.folder_gb[b["folder"]] = sum(size for _, size in self.backups)
+
+    def delete_old_backups(self) -> None:
+        """Видаляє бекапи, старші за строк зберігання (завдання о 06:00 або адміністратор)."""
+        b = self.profile["backup"]
+        keep_after = self.now - timedelta(days=b["retention_days"])
+        self.backups = [(end, size) for end, size in self.backups if end > keep_after]
+        self.sync_backup_folder()
 
     def complete_backup(self) -> list[dict]:
         """Успішний бекап щойно закінчився: новий файл у теці бекапів."""
@@ -295,10 +310,9 @@ def backup_routine(state: ServerState, t: datetime) -> list[dict]:
         events += state.complete_backup()
 
     # Окреме завдання прибирання: видаляє бекапи, старші за строк зберігання
-    if local.hour == b["cleanup_hour"] and local.minute == 0:
-        keep_after = t - timedelta(days=b["retention_days"])
-        state.backups = [(end, size) for end, size in state.backups if end > keep_after]
-        state.sync_backup_folder()
+    # (не працює, поки зламано видалення старих файлів — retention_stopped)
+    if local.hour == b["cleanup_hour"] and local.minute == 0 and not state.retention_stopped:
+        state.delete_old_backups()
     return events
 
 
@@ -311,8 +325,9 @@ def advance_state(state: ServerState, t: datetime) -> None:
         state.folder_gb[f["path"]] += rate / 1440
         cleanup = f.get("weekly_cleanup")
         if (cleanup and local.weekday() == cleanup["weekday"]
-                and local.hour == cleanup["hour"] and local.minute == 0):
-            state.folder_gb[f["path"]] = min(state.folder_gb[f["path"]], cleanup["keep_gb"])
+                and local.hour == cleanup["hour"] and local.minute == 0
+                and not state.retention_stopped):
+            state.clean_folder(f)
     for drive, cfg in state.profile["drives"].items():
         state.drive_other_gb[drive] += cfg.get("growth_gb_per_day", 0.0) / 1440
     if state.cert_days is not None:
@@ -453,6 +468,9 @@ def reset_sim_data() -> None:
                                    "(SELECT id FROM servers WHERE kind = 'sim')").rowcount
             if deleted:
                 print(f"  видалено з {table}: {deleted}")
+        # Номери інцидентів знову з 1: SQLite сам не скидає лічильник AUTOINCREMENT
+        if conn.execute("SELECT COUNT(*) FROM sim_incidents").fetchone()[0] == 0:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'sim_incidents'")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +627,8 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
 
     for server, prof in profiles["servers"].items():
         busy: list[tuple[datetime, datetime]] = []
+        # Проміжки, де не можна ставити збій бекапу (див. 1б нижче)
+        no_backup_fail: list[tuple[datetime, datetime]] = []
 
         def is_free(s, e, margin=60):
             return all(e + minutes(margin) <= bs or s >= be + minutes(margin) for bs, be in busy)
@@ -623,6 +643,9 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
                 plan = propose()   # список (сценарій, початок, кінець, параметри)
                 s = min(item[1] for item in plan)
                 e = max(item[2] for item in plan)
+                fails_backup = any(item[0] == "backup_stale" for item in plan)
+                if fails_backup and any(s < be and e > bs for bs, be in no_backup_fail):
+                    continue
                 if start + timedelta(hours=12) <= s and e <= end - timedelta(hours=6) and is_free(s, e):
                     for scenario, ps, pe, params in plan:
                         incidents.append({
@@ -648,6 +671,28 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
                 s = start + minutes(rng.randint(5 * 1440, (days - 10) * 1440))
                 return [("cert_expiring", s, s + minutes(rng.randint(3 * 1440, 5 * 1440)), {})]
             place(propose_cert)
+
+        # 1б) Повільне заповнення диска (дні) — теж довге, ставимо одразу після сертифіката.
+        #     Закінчення — «адміністратор помітив і почистив» у денний час (+4–18 год)
+        slow = prof.get("history_slow_disk_fill")
+        if slow:
+            def propose_slow(slow=slow):
+                lo, hi = slow["days"]
+                if "start_local_hour" in slow:
+                    day = rng.randint(1, days - hi - 2)
+                    s = local_day_start(start, tz) + timedelta(
+                        days=day, hours=slow["start_local_hour"], minutes=rng.randint(0, 50))
+                else:
+                    s = start + minutes(rng.randint(1440, (days - hi - 1) * 1440))
+                e = s + timedelta(days=rng.randint(lo, hi), hours=rng.randint(4, 18))
+                return [("disk_fill", s, e, {"cause": slow["cause"]})]
+            place(propose_slow)
+            # Збій бекапу за тиждень до повільного заповнення лишив би на E: на один
+            # бекап менше, і сходинки почалися б нижче (не дійшли б до ~93 %)
+            if prof.get("backup"):
+                slow_s, slow_e = busy[-1]
+                no_backup_fail.append((slow_s - timedelta(days=prof["backup"]["retention_days"] + 1),
+                                       slow_e))
 
         # 2) Ланцюжки «причина → наслідок», що накладаються
         for chain in prof.get("history_chains", []):

@@ -86,11 +86,18 @@ servers:
     history_chains:
       - {cause: memory_leak, effect: apppool_crash, count: 2, effect_params: {pool: ApiPool}}
 
+    # Повільне заповнення диска (disk_fill з причиною, днями): перестало працювати
+    # щотижневе прибирання логів IIS -> D: росте з нормальною швидкістю логів
+    history_slow_disk_fill: {cause: retention_stopped, days: [10, 13]}
+
     # Що саме ламають сценарії на цьому сервері
     scenario_targets:
       cpu_spike: {process: w3wp.exe, app_pool: ApiPool}
       memory_leak: {process: w3wp.exe, app_pool: ApiPool}
-      disk_fill: {folder: 'D:\inetpub\logs\LogFiles'}
+      # folder — для cause=fast; retention_folder — де не видаляється старе;
+      # log_folder — які логи пишуться в 5–10 разів швидше (cause=log_burst)
+      disk_fill: {folder: 'D:\inetpub\logs\LogFiles', retention_folder: 'D:\inetpub\logs\LogFiles',
+                  log_folder: 'D:\inetpub\logs\LogFiles'}
       service_stop: {service: PortalSyncService}
       apppool_crash: {pools: [SitePool, ApiPool]}
 
@@ -173,8 +180,17 @@ servers:
     history_chains:
       - {cause: disk_fill, effect: backup_stale, count: 1, cause_params: {folder: 'E:\Exports'}}
 
+    # Повільне заповнення: не видаляються старі бекапи -> E: +~9,5 % щоночі після бекапу.
+    # Починається о 05:xx (перед видаленням о 06:00); ~2,5 дня — з ~67 до ~96 %.
+    # Довше не можна: на 4-ту ніч бекап не помістився б і впав сам (без мітки).
+    history_slow_disk_fill: {cause: retention_stopped, days: [2, 2], start_local_hour: 5}
+
     scenario_targets:
       cpu_spike: {process: sqlservr.exe}
       memory_leak: {process: sqlservr.exe}
-      disk_fill: {folder: 'D:\SQLLogs'}     # некерований ріст журналу транзакцій
+      # folder — некерований ріст журналу транзакцій (cause=fast); retention_folder —
+      # старі бекапи не видаляються; log_folder — журнал транзакцій пишеться в 5–10 разів
+      # швидше (у нормі файл журналу не росте, тому норма задана: log_base_gb_per_day)
+      disk_fill: {folder: 'D:\SQLLogs', retention_folder: 'E:\Backup',
+                  log_folder: 'D:\SQLLogs', log_base_gb_per_day: 2}
       service_stop: {service: SQLSERVERAGENT}

@@ -115,14 +115,74 @@ class MemoryLeak(Scenario):
 
 
 class DiskFill(Scenario):
-    """Тека некеровано росте, диск заповнюється до ~93 %, потім «прибирання».
+    """Диск заповнюється; закінчення — «адміністратор помітив і почистив».
 
-    Тека — з params["folder"] (для ланцюжків) або з scenario_targets профілю.
+    Причина — params["cause"]:
+      fast              — тека некеровано росте за години до ~93 % (за замовчуванням).
+                          Тека — з params["folder"] (для ланцюжків) або scenario_targets.folder;
+      retention_stopped — перестало працювати видалення старих файлів (щотижневе прибирання
+                          логів IIS, видалення старих бекапів). Нові файли пишуться як завжди,
+                          старі не видаляються — диск росте днями й тижнями. Тека для
+                          «ключа відповідей» — scenario_targets.retention_folder;
+      log_burst         — логи пишуться в 5–10 разів швидше за норму кілька днів
+                          (тека — scenario_targets.log_folder).
+    Агент бачить лише наслідки: ріст теки й диска, запис на диск, подію 2013 після 90 %.
     """
     name = "disk_fill"
-    duration_min = (120, 360)
+    duration_min = (120, 360)        # для fast; повільні причини — дні (див. profiles.yaml)
+    plateau_pct = 93                 # вище диск не заповнюється (fast і log_burst)
+
+    def start(self, state, params, rng):
+        cause = params.setdefault("cause", "fast")
+        t = self.target(state, self.name)
+        if cause == "retention_stopped":
+            state.retention_stopped = True
+            params.setdefault("folder", t["retention_folder"])
+        elif cause == "log_burst":
+            params.setdefault("folder", t["log_folder"])
+            params.setdefault("burst_factor", round(rng.uniform(5, 10), 1))
+            params["added_gb"] = 0.0
+        return []
 
     def apply(self, state, values, minute, params, rng):
+        cause = params.get("cause", "fast")
+        if cause == "fast":
+            self.grow_fast(state, values, params, rng)
+        elif cause == "log_burst":
+            self.grow_burst(state, values, params, rng)
+        # retention_stopped: щохвилини нічого не робимо — диск росте сам,
+        # бо в simulator.py прибирання вимкнено (state.retention_stopped)
+        return self.warn_if_full(state, params)
+
+    def grow_burst(self, state, values, params, rng):
+        """Логи пишуться в burst_factor разів швидше; нормальну частину вже додав
+        advance_state у simulator.py, тут — лише «зайва»."""
+        folder = params["folder"]
+        drive = state.folder_drive(folder)
+        local = state.now + state.tz
+        conf = next(f for f in state.profile["folders"] if f["path"] == folder)
+        base = conf.get("weekend_gb_per_day" if local.weekday() >= 5 else "weekday_gb_per_day", 0.0)
+        # Тека, яка зазвичай не росте (журнал транзакцій SQL): норма — з профілю
+        base = base or self.target(state, self.name).get("log_base_gb_per_day", 1.0)
+        if state.drive_used_pct(drive) >= self.plateau_pct:
+            return
+        step = base * (params["burst_factor"] - 1) / 1440 * rng.uniform(0.7, 1.3)
+        state.folder_gb[folder] += step
+        params["added_gb"] += step
+        values["disk_write_mbs"] += step * 1024 / 60     # ГБ/хв -> МБ/с
+
+    def warn_if_full(self, state, params):
+        """Подія 2013 — один раз, коли диск перейшов 90 %."""
+        drive = state.folder_drive(params["folder"])
+        if state.drive_used_pct(drive) > 90 and not params.get("warned"):
+            params["warned"] = True
+            return [event(
+                "System", "srv", 2013, "Warning",
+                f"The {drive} disk is at or near capacity. "
+                "You may need to delete some files.")]
+        return []
+
+    def grow_fast(self, state, values, params, rng):
         if "rate_gb_per_min" not in params:
             folder = params.get("folder") or self.target(state, self.name)["folder"]
             drive = state.folder_drive(folder)
@@ -146,19 +206,20 @@ class DiskFill(Scenario):
         params["added_gb"] += step
         values["disk_write_mbs"] += step * 1024 / 60   # ГБ/хв -> МБ/с
 
-        events = []
-        if state.drive_used_pct(params["drive"]) > 90 and not params["warned"]:
-            params["warned"] = True
-            events.append(event(
-                "System", "srv", 2013, "Warning",
-                f"The {params['drive']} disk is at or near capacity. "
-                "You may need to delete some files."))
-        return events
-
     def end(self, state, params, rng):
-        # «Прибирання»: прибираємо все, що наросло під час інциденту
+        if params.get("cause") == "retention_stopped":
+            # Адміністратор видалив старе вручну — те саме, що зробило б прибирання;
+            # далі прибирання знову працює за розкладом
+            state.retention_stopped = False
+            for f in state.profile["folders"]:
+                if f.get("weekly_cleanup"):
+                    state.clean_folder(f)
+            if state.profile.get("backup"):
+                state.delete_old_backups()
+            return []
+        # fast і log_burst: прибираємо все, що наросло під час інциденту
         folder = params.get("folder")
-        if folder:
+        if folder and params.get("added_gb"):
             state.folder_gb[folder] = max(state.folder_gb[folder] - params["added_gb"], 0.1)
         return []
 
