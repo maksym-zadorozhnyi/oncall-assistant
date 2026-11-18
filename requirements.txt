@@ -1,0 +1,9 @@
+# Залежності проєкту. Доповнюються на кожному кроці (див. docs/milestones.md).
+# Встановлення: .venv\Scripts\python -m pip install -r requirements.txt
+
+# --- Фаза 1: каркас, агент, симулятор ---
+psutil==7.2.2          # метрики ПК: CPU, RAM, диски, мережа, процеси
+pandas==3.1.1          # таблиці і агрегати
+matplotlib==3.11.2     # графіки (PNG)
+python-dotenv==1.2.4   # читання ключів з .env
+PyYAML==6.0.3          # читання rules.yaml, ontology.yaml, config.yaml

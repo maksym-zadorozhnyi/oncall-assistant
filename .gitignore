@@ -1,0 +1,23 @@
+# Віртуальне середовище Python
+.venv/
+
+# Секрети — ніколи не комітимо
+.env
+
+# Кеш Python
+__pycache__/
+*.pyc
+
+# База даних: перегенерується симулятором, а згодом міститиме реальні
+# дані ПК, яким не місце в публічному репозиторії
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Векторна база ChromaDB (перебудовується з knowledge/runbooks)
+data/chroma/
+
+# Службові файли
+.ipynb_checkpoints/
+.vscode/
+Thumbs.db
