@@ -140,7 +140,7 @@ docs/         tz.pdf, milestones.md, progress.md, decisions.md, er.md, experimen
 - `folder_sizes` — ts, server_id, path, size_gb
 - `service_status` — ts, server_id, name, kind (service/apppool), status
 - `events` — ts, server_id, log, source, event_id, level, message
-- `checks` — ts, server_id, check (http/cert/backup/sql_port), ok, value, details
+- `checks` — ts, server_id, check_type (http/cert/backup/sql_port), ok, value, details
 - `sim_incidents` — id, server_id, scenario, started_at, ended_at
   (пише симулятор; це «правильні відповіді» для оцінки F1 детектора аномалій
   і класифікатора)

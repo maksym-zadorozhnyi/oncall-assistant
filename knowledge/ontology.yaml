@@ -1,0 +1,221 @@
+# Онтологія предметної галузі: поняття і зв'язки між ними.
+# Чернетка кроку 1.2. На кроці 3.2 доповнюється посиланнями на ранбуки.
+#
+# Як читати:
+#   classes        — які поняття є в системі
+#   relations      — які зв'язки між ними можливі (з чого → у що)
+#   incident_types — 8 типів інцидентів: на що впливає, яким правилом
+#                    виявляється, яким ранбуком пояснюється, за якими даними
+#   event_codes    — коди подій Windows і на який тип інциденту вони вказують.
+#                    Зазвичай indicates — одна назва інциденту. Якщо подія
+#                    вказує на різні інциденти залежно від обставин,
+#                    indicates — список варіантів з умовою when.
+#
+# Ідентифікатори правил (rule_id) — чернетка; остаточно їх задасть
+# knowledge/rules.yaml (крок 2.3 для диска, крок 4.1 для решти).
+# Назви файлів ранбуків — теж чернетка (остаточно — крок 3.2).
+
+version: 0.1
+
+classes:
+  Server: Windows-сервер (реальний або симульований sim-*)
+  Disk: логічний диск сервера (C:, D:, ...)
+  Folder: тека на диску, розмір якої відстежуємо (логи IIS, бекапи, ...)
+  Service: служба Windows (наприклад MSSQLSERVER)
+  AppPool: пул застосунків IIS
+  Site: вебсайт, доступність якого перевіряємо по HTTP
+  Certificate: сертифікат сайту зі сховища Cert:\
+  Backup: файл резервної копії бази (.bak)
+  Metric: числовий показник (cpu_pct, ram_pct, disk_used_pct, ...)
+  IncidentType: тип інциденту (один з восьми нижче)
+  Rule: правило з knowledge/rules.yaml, яке виявляє інцидент
+  Runbook: інструкція з knowledge/runbooks/, що пояснює, як діяти
+  EventCode: код події в журналі Windows
+
+relations:
+  has:
+    from: Server
+    to: [Disk, Service, AppPool, Site, Certificate, Backup]
+  contains:
+    from: Disk
+    to: [Folder]
+  serves:
+    from: AppPool
+    to: [Site]
+  measured_by:
+    from: [Server, Disk]
+    to: [Metric]
+  affects:
+    from: IncidentType
+    to: [Disk, Server, Service, AppPool, Site, Certificate, Backup]
+  detected_by:
+    from: IncidentType
+    to: [Rule]
+  explained_by:
+    from: IncidentType
+    to: [Runbook]
+  indicates:
+    from: EventCode
+    to: [IncidentType]
+
+incident_types:
+  disk_fill:
+    name: Диск заповнюється
+    affects: Disk
+    detected_by: [DISK_USED_HIGH, DISK_FORECAST]
+    explained_by: disk-fill.md          # назву вирішимо на кроці 3.2
+    signals:                            # звідки беруться дані (таблиця.колонка)
+      - disk_usage.used_pct
+      - predictions.hours_to_threshold
+      - folder_sizes.size_gb
+    sim_scenario: disk_fill
+
+  cpu_high:
+    name: Високе навантаження CPU
+    affects: Server
+    detected_by: [CPU_HIGH]
+    explained_by: cpu-high.md
+    signals:
+      - metrics.cpu_pct
+      - process_snapshots.cpu_pct
+    sim_scenario: cpu_spike
+
+  memory_low:
+    name: Мало пам'яті / витік
+    affects: Server
+    detected_by: [MEM_HIGH, MEM_EXHAUSTION_EVENT]
+    explained_by: memory-low.md
+    signals:
+      - metrics.ram_pct
+      - process_snapshots.ram_mb
+      - events.event_id
+    sim_scenario: memory_leak
+
+  service_down:
+    name: Служба зупинилась
+    affects: Service
+    detected_by: [SERVICE_STOPPED, SERVICE_CRASH_EVENT]
+    explained_by: service-down.md
+    signals:
+      - service_status.status
+      - events.event_id
+    sim_scenario: service_stop
+
+  apppool_down:
+    name: Пул IIS впав
+    affects: AppPool
+    detected_by: [APPPOOL_STOPPED, WAS_EVENT]
+    explained_by: apppool-down.md
+    signals:
+      - service_status.status
+      - events.event_id
+    sim_scenario: apppool_crash
+
+  site_down:
+    name: Сайт не відповідає
+    affects: Site
+    detected_by: [SITE_HTTP_ERROR, SITE_SLOW]
+    explained_by: site-down.md
+    signals:
+      - checks.ok
+      - checks.value
+      - metrics.app_response_ms
+    sim_scenario: site_down
+
+  cert_expiry:
+    name: Сертифікат закінчується
+    affects: Certificate
+    detected_by: [CERT_EXPIRING]
+    explained_by: cert-expiry.md
+    signals:
+      - checks.value
+    sim_scenario: cert_expiring
+
+  backup_missing:
+    name: Немає свіжого бекапу
+    affects: Backup
+    detected_by: [BACKUP_STALE]
+    explained_by: backup-missing.md
+    signals:
+      - checks.value
+      - events.event_id
+    sim_scenario: backup_stale
+
+# Коди подій Windows. Для cpu_high, site_down і cert_expiry окремих
+# стандартних подій немає: їх виявляємо за метриками і перевірками.
+event_codes:
+  - id: 2013
+    log: System
+    source: srv
+    indicates: disk_fill
+    meaning: диск заповнений або майже заповнений
+
+  - id: 2004
+    log: System
+    source: Microsoft-Windows-Resource-Exhaustion-Detector
+    indicates: memory_low
+    meaning: бракує віртуальної пам'яті; у події названо процеси-споживачі
+
+  - id: 7031
+    log: System
+    source: Service Control Manager
+    indicates: service_down
+    meaning: служба несподівано завершилась, виконано дію відновлення
+
+  - id: 7034
+    log: System
+    source: Service Control Manager
+    indicates: service_down
+    meaning: служба несподівано завершилась (без дії відновлення)
+
+  - id: 5002
+    log: System
+    source: WAS
+    indicates: apppool_down
+    meaning: пул автоматично вимкнено через серію збоїв (Rapid-Fail Protection)
+
+  - id: 5009
+    log: System
+    source: WAS
+    indicates: apppool_down
+    meaning: робочий процес пулу (w3wp.exe) несподівано завершився
+
+  - id: 5010
+    log: System
+    source: WAS
+    indicates: apppool_down
+    meaning: робочий процес пулу не відповів на ping
+
+  - id: 5011
+    log: System
+    source: WAS
+    indicates: apppool_down
+    meaning: робочий процес пулу втратив зв'язок з WAS (фатальна помилка)
+
+  - id: 3041
+    log: Application
+    source: MSSQLSERVER
+    indicates: backup_missing
+    meaning: команду BACKUP не завершено (резервну копію не створено)
+
+  # Збої процесів: на який інцидент вказують — залежить від того,
+  # який процес упав (його назва є в тексті події)
+  - id: 1000
+    log: Application
+    source: Application Error
+    meaning: процес аварійно завершився (Faulting application name у тексті події)
+    indicates:
+      - incident: apppool_down
+        when: процес — w3wp.exe (робочий процес пулу IIS)
+      - incident: service_down
+        when: процес — виконуваний файл служби зі списку моніторингу
+
+  - id: 1026
+    log: Application
+    source: .NET Runtime
+    meaning: .NET-застосунок завершено через необроблений виняток (Application у тексті події)
+    indicates:
+      - incident: apppool_down
+        when: процес — w3wp.exe (робочий процес пулу IIS)
+      - incident: service_down
+        when: процес — виконуваний файл служби зі списку моніторингу

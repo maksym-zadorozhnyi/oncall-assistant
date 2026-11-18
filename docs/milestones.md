@@ -59,16 +59,30 @@
 
 ### 1.7 Сценарії інцидентів
 - **Що:** `--scenario <назва> --server sim-1` для `disk_fill`, `cpu_spike`,
-  `memory_leak`, `service_stop`.
+  `memory_leak`, `service_stop`, `apppool_crash`, `site_down`,
+  `cert_expiring`, `backup_stale` — по сценарію на кожен з 8 типів інцидентів
+  (зв'язок задано полем `sim_scenario` в `knowledge/ontology.yaml`).
+  У звичайному режимі симулятор пише нормальні перевірки в `checks`
+  (HTTP 200, сертифікат дійсний ще ~200 днів, бекап молодший за 24 год),
+  щоб сценаріям було від чого відхилятися.
 - **Готово, коли:**
   - `disk_fill`: зайнятість диска помітно росте (для демо прискорено, ~1 % на хв);
   - `cpu_spike`: CPU 92–98 % протягом 10 хв;
   - `memory_leak`: RAM монотонно росте;
   - `service_stop`: у `service_status` служба `stopped`, у `events` — подія 7034;
+  - `apppool_crash`: у `events` — подія 1000 для w3wp.exe і WAS 5009, потім 5002;
+    у `service_status` пул (`kind = apppool`) `stopped`;
+  - `site_down`: у `checks` (`check_type = http`) `ok = 0` з кодом 500/503 або
+    відповіддю > 2 с; `app_response_ms` і `app_error_pct` у `metrics` ростуть;
+  - `cert_expiring`: у `checks` (`check_type = cert`) кількість днів до кінця
+    падає нижче 30, потім нижче 7 (для демо прискорено);
+  - `backup_stale`: у `checks` (`check_type = backup`) вік останнього бекапу
+    перевищує 24 год, `ok = 0`; у `events` — подія MSSQLSERVER 3041;
   - для кожного сценарію в `sim_incidents` є запис з `started_at`,
     а після завершення — з `ended_at`;
   - після завершення сценарію значення повертаються в норму
-    (для диска — симуляція «прибирання»).
+    (для диска — симуляція «прибирання», для сертифіката — «оновлення»,
+    для бекапу — новий успішний бекап, для пулу — перезапуск).
 
 ---
 
