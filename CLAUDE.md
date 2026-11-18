@@ -70,6 +70,7 @@
 | Звіти | pandas (агрегати) + matplotlib (графіки) + openpyxl (Excel-виписка) + LLM (текстовий підсумок) |
 | Агент | власний скрипт: psutil + PowerShell (`Get-WinEvent`, `appcmd`, `Cert:\`); дані надсилає через `POST /ingest` |
 | Відео (необов'язково) | OpenCV: витяг кадрів → аналіз скріншотів |
+| Тести | pytest (`python -m pytest`), кожен тест — на тимчасовій базі |
 
 ## Архітектура
 

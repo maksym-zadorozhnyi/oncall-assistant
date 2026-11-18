@@ -7,3 +7,6 @@ pandas==3.1.1          # таблиці і агрегати
 matplotlib==3.11.2     # графіки (PNG)
 python-dotenv==1.2.4   # читання ключів з .env
 PyYAML==6.0.3          # читання rules.yaml, ontology.yaml, config.yaml
+
+# --- Фаза 2: ETL, прогноз, правила ---
+pytest==9.2.0          # автоматичні тести: python -m pytest
