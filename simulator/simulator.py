@@ -9,6 +9,7 @@
     python -m simulator.simulator --plot                  # контрольний графік у docs/experiments/
     python -m simulator.simulator --incidents             # список інцидентів з sim_incidents
     python -m simulator.simulator --plot-incident 5       # графік інциденту №5 (±2 год, по хвилинах)
+    python -m simulator.simulator --details 5             # подробиці інциденту №5 (процеси, теки, служби, події)
 
 Живий потік (--live) і ручний запуск сценаріїв (--scenario) — кроки 1.6–1.7.
 
@@ -16,6 +17,7 @@
 """
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -54,6 +56,27 @@ NOISE_EVENTS = [
 
 def fmt(t: datetime) -> str:
     return t.strftime(TS_FORMAT)
+
+
+# Параметри сценарію, які зберігаються в sim_incidents.params_json
+# (службові проміжні значення сценаріїв — швидкість росту тощо — не зберігаємо)
+PARAM_KEYS = ["process", "app_pool", "service", "pool", "drive", "folder",
+              "variant", "reason", "duration_min", "fill_minutes"]
+
+
+def fmt_duration(minutes: int) -> str:
+    """Тривалість словами: «13 хв», «4 год 52 хв», «1 д 0 год 40 хв»."""
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    if days:
+        return f"{days} д {hours} год {mins} хв"
+    if hours:
+        return f"{hours} год {mins} хв"
+    return f"{mins} хв"
+
+
+def incident_params_json(params: dict) -> str:
+    return json.dumps({k: params[k] for k in PARAM_KEYS if params.get(k) is not None}, ensure_ascii=False)
 
 
 def r(value, digits):
@@ -162,9 +185,14 @@ class ServerState:
         self.last_backup_ok = True
         self.backup_running_until = None
         self.sync_backup_folder()
+        # Текст — як у справжньому журналі SQL Server (сторінка = 8 КБ)
+        pages = int(size * 1024 * 1024 / 8)
         return [event("Application", "MSSQLSERVER", 18264, "Information",
-                      f"Database backed up. Database: {b['database']}, "
-                      f"size: {size:.1f} GB, file: {b['folder']}\\{b['database']}.bak")]
+                      f"Database backed up. Database: {b['database']}, creation date(time): "
+                      f"2024/03/11(09:15:42), pages dumped: {pages}, first LSN: 0:0:0, last LSN: 0:0:0, "
+                      f"number of dump devices: 1, device information: (FILE=1, TYPE=DISK: "
+                      f"{{'{b['folder']}\\{b['database']}.bak'}}). "
+                      "This is an informational message only. No user action is required.")]
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +268,26 @@ def backup_routine(state: ServerState, t: datetime) -> list[dict]:
     local = t + state.tz
 
     if local.hour == b["hour"] and local.minute == 0:
+        backup_drive = state.folder_drive(b["folder"])
+        free_gb = state.drive_total_gb(backup_drive) - state.drive_used_gb(backup_drive)
+        size_gb = state.folder_gb[b["data_folder"]] * b["size_ratio"]
         if state.backup_fail_next:
             # Бекап зламано сценарієм backup_stale (подію 3041 записав сценарій)
             state.backup_fail_next = False
+        elif free_gb < size_gb:
+            # Бекап не поміщається на диск — падає сам, без жодного сценарію.
+            # Як у справжньому SQL Server: причина — окремою подією 18210,
+            # а 3041 — лише загальне «бекап не вдався»
+            state.last_backup_ok = False
+            bak_file = f"{b['folder']}\\{b['database']}.bak"
+            events.append(event(
+                "Application", "MSSQLSERVER", 18210, "Error",
+                f"BackupIoRequest::ReportIoError: write failure on backup device '{bak_file}'. "
+                "Operating system error 112(There is not enough space on the disk.)."))
+            events.append(event(
+                "Application", "MSSQLSERVER", 3041, "Error",
+                f"BACKUP failed to complete the command BACKUP DATABASE {b['database']}. "
+                "Check the backup application log for detailed messages."))
         else:
             state.backup_running_until = t + timedelta(minutes=b["duration_min"])
 
@@ -274,6 +319,30 @@ def advance_state(state: ServerState, t: datetime) -> None:
         state.cert_days -= 1 / 1440
 
 
+def missing_processes(state: ServerState, values: dict) -> list[dict]:
+    """Процеси профілю, яких зараз немає: служба / пул зупинені або процес упав."""
+    hidden = {(o.get("name"), o.get("app_pool")) for o in values["process_overrides"] if o.get("hide")}
+    missing = []
+    for p in state.profile["processes"]:
+        owner = p.get("service") or p.get("app_pool")
+        if (owner and state.service_status.get(owner) != "running") or (p["name"], p.get("app_pool")) in hidden:
+            missing.append(p)
+    return missing
+
+
+def subtract_missing_processes(state: ServerState, values: dict) -> None:
+    """Якщо процесу немає, його частка CPU і пам'ять звільняються.
+
+    Так зупинка служби видна і в загальних метриках: наприклад, зупинка
+    MSSQLSERVER різко зменшує RAM сервера БД, а падіння пулу — CPU вебсервера.
+    """
+    total_cpu = values["cpu_pct"]
+    ram_total_mb = state.profile["ram_total_gb"] * 1024
+    for p in missing_processes(state, values):
+        values["cpu_pct"] -= total_cpu * p["cpu_share"]
+        values["ram_pct"] -= 100 * p["ram_mb"] / ram_total_mb
+
+
 def build_processes(state: ServerState, values: dict, rng: random.Random) -> list[dict]:
     """Топ-5 процесів за CPU з урахуванням зупинених служб і змін від сценаріїв."""
     total = values["cpu_pct"]
@@ -296,10 +365,21 @@ def build_processes(state: ServerState, values: dict, rng: random.Random) -> lis
                 continue
             if o.get("hide"):
                 procs.remove(proc)
+                continue
             if "cpu_pct" in o:
                 proc["cpu_pct"] = o["cpu_pct"]
+                proc["fixed"] = True
             if "ram_add_mb" in o:
                 proc["ram_mb"] += o["ram_add_mb"]
+    # Сума CPU процесів не може перевищувати CPU сервера: якщо сценарій
+    # задав процесу CPU вручну, решта процесів ділить лише залишок
+    fixed = sum(p["cpu_pct"] for p in procs if p.get("fixed"))
+    others = sum(p["cpu_pct"] for p in procs if not p.get("fixed"))
+    if fixed + others > total * 0.98 and others > 0:
+        factor = max(total * 0.98 - fixed, 0) / others
+        for proc in procs:
+            if not proc.get("fixed"):
+                proc["cpu_pct"] *= factor
     for proc in procs:
         proc["cpu_pct"] = min(proc["cpu_pct"], total)
     procs.sort(key=lambda pr: pr["cpu_pct"], reverse=True)
@@ -415,6 +495,7 @@ class Simulation:
         for inc in self.active[name]:
             minute = int((t - inc["start"]).total_seconds() // 60)
             events += SCENARIOS[inc["scenario"]].apply(state, values, minute, inc["params"], rng)
+        subtract_missing_processes(state, values)   # зупинена служба звільняє CPU і RAM
 
         # 6. Повільні зміни і фонові події
         advance_state(state, t)
@@ -537,7 +618,14 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
                     return
             raise RuntimeError(f"Не вдалося розмістити інциденти на {server}: забагато для {days} днів")
 
-        counts = dict(prof.get("history_incidents", {}))
+        # history_incidents: «тип: кількість» або «тип: {count: N, params: {...}}»
+        counts, fixed_params = {}, {}
+        for scenario, value in prof.get("history_incidents", {}).items():
+            if isinstance(value, dict):
+                counts[scenario] = value["count"]
+                fixed_params[scenario] = value.get("params", {})
+            else:
+                counts[scenario] = value
 
         # 1) Сертифікат — найдовший (кілька днів), ставимо першим
         for _ in range(counts.pop("cert_expiring", 0)):
@@ -552,11 +640,17 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
                 if chain["effect"] == "backup_stale":
                     def propose_chain(chain=chain):
                         night = backup_night(rng.randint(1, days - 3))
-                        cause_s = night - minutes(rng.randint(3 * 60, 6 * 60))   # почалось увечері
-                        cause_e = night + minutes(rng.randint(4 * 60, 7 * 60))   # прибрали вранці
+                        fill_min = rng.randint(3 * 60, 6 * 60)
+                        cause_s = night - minutes(fill_min)                        # почалось увечері
+                        cause_e = night + minutes(rng.randint(4 * 60, 7 * 60))    # прибрали вранці
                         stale_e = night + timedelta(days=1, minutes=prof["backup"]["duration_min"])
-                        return [(chain["cause"], cause_s, cause_e, chain.get("cause_params")),
-                                ("backup_stale", night, stale_e, chain.get("effect_params"))]
+                        # Диск заповнюється ще ДО бекапу (за 15–45 хв до 02:00) —
+                        # тоді бекап не поміщається і падає сам (події 18210 і 3041)
+                        cause_params = dict(chain.get("cause_params") or {},
+                                            fill_minutes=fill_min - rng.randint(15, 45))
+                        effect_params = dict(chain.get("effect_params") or {}, reason="no_space")
+                        return [(chain["cause"], cause_s, cause_e, cause_params),
+                                ("backup_stale", night, stale_e, effect_params)]
                 else:
                     def propose_chain(chain=chain):
                         lo, hi = SCENARIOS[chain["cause"]].duration_min
@@ -583,7 +677,7 @@ def schedule_history_incidents(rng, profiles, start, end) -> list[dict]:
                 def propose_other(scenario=scenario):
                     lo, hi = SCENARIOS[scenario].duration_min
                     s = start + minutes(rng.randint(0, total_min))
-                    return [(scenario, s, s + minutes(rng.randint(lo, hi)), {})]
+                    return [(scenario, s, s + minutes(rng.randint(lo, hi)), fixed_params.get(scenario))]
                 place(propose_other)
 
     incidents.sort(key=lambda inc: inc["start"])
@@ -661,11 +755,13 @@ def generate_history(days: int, seed: int) -> None:
             print(f"  день {i // 1440} з {days}", end="\r")
     sim.flush()
 
-    # --- Мітки інцидентів («правильні відповіді» для оцінки ML) ---
+    # --- Мітки інцидентів («ключ відповідей» для перевірки і оцінки ML) ---
     with db_session() as conn:
         for inc in incidents:
-            conn.execute("INSERT INTO sim_incidents (server_id, scenario, started_at, ended_at) VALUES (?,?,?,?)",
-                         (server_ids[inc["server"]], inc["scenario"], fmt(inc["start"]), fmt(inc["end"])))
+            conn.execute("INSERT INTO sim_incidents (server_id, scenario, started_at, ended_at, params_json) "
+                         "VALUES (?,?,?,?,?)",
+                         (server_ids[inc["server"]], inc["scenario"], fmt(inc["start"]), fmt(inc["end"]),
+                          incident_params_json(inc["params"])))
 
     long_gaps = sum(LONG_GAPS.values())
     print_summary(incidents, sim.stats, long_gaps, tz)
@@ -684,15 +780,13 @@ def print_summary(incidents, stats, long_gaps, tz) -> None:
 
     print(f"\nІнциденти в sim_incidents: {len(incidents)} "
           f"(різних типів: {len({i['scenario'] for i in incidents})})")
-    print(f"  {'сервер':<7}{'сценарій':<15}{'початок (місц.)':<18}{'тривалість':>12}")
+    print(f"  {'сервер':<7}{'сценарій':<15}{'початок (місц.)':<18}{'тривалість':>16}")
     for inc in incidents:
-        dur = inc["end"] - inc["start"]
-        dur_txt = (f"{dur.days} д {dur.seconds // 3600} год" if dur.days
-                   else f"{int(dur.total_seconds() // 60)} хв")
+        dur_txt = fmt_duration(int((inc["end"] - inc["start"]).total_seconds() // 60))
         local = (inc["start"] + tz).strftime("%d.%m %a %H:%M")
         overlap = any(o is not inc and o["server"] == inc["server"]
                       and o["start"] < inc["end"] and inc["start"] < o["end"] for o in incidents)
-        print(f"  {inc['server']:<7}{inc['scenario']:<15}{local:<18}{dur_txt:>12}"
+        print(f"  {inc['server']:<7}{inc['scenario']:<15}{local:<18}{dur_txt:>16}"
               f"{'   <- ланцюжок' if overlap else ''}")
 
 
@@ -734,22 +828,34 @@ def plot_history() -> None:
             part = part[part["drive"] == drive]
         return part.set_index("ts")[column].resample("1h").mean()
 
+    # Панель: (заголовок, [(підпис лінії, ряд), ...], сервер, чи показувати вихідні)
     panels = [
-        ("sim-1: CPU, % (середнє за годину)", hourly(metrics, "sim-1", "cpu_pct"), "sim-1", True),
-        ("sim-1: RAM, % (середнє за годину; витоки пам'яті)", hourly(metrics, "sim-1", "ram_pct"), "sim-1", True),
+        ("sim-1: CPU, % (середнє за годину)", [("CPU", hourly(metrics, "sim-1", "cpu_pct"))], "sim-1", True),
+        ("sim-1: RAM, % (середнє за годину; витоки пам'яті)",
+         [("RAM", hourly(metrics, "sim-1", "ram_pct"))], "sim-1", True),
         ("sim-1: диск D:, % зайнято (логи IIS, щотижневе прибирання)",
-         hourly(disks, "sim-1", "used_pct", "D:"), "sim-1", False),
-        ("sim-2: CPU, % (середнє за годину; нічний бекап о 02:00)", hourly(metrics, "sim-2", "cpu_pct"), "sim-2", True),
+         [("D:", hourly(disks, "sim-1", "used_pct", "D:"))], "sim-1", False),
+        ("sim-2: CPU, % (середнє за годину; нічний бекап о 02:00)",
+         [("CPU", hourly(metrics, "sim-2", "cpu_pct"))], "sim-2", True),
         ("sim-2: RAM, % (середнє за годину; SQL Server тримає пам'ять)",
-         hourly(metrics, "sim-2", "ram_pct"), "sim-2", True),
-        ("sim-2: диск E:, % зайнято (бекапи і вивантаження)", hourly(disks, "sim-2", "used_pct", "E:"), "sim-2", False),
+         [("RAM", hourly(metrics, "sim-2", "ram_pct"))], "sim-2", True),
+        ("sim-2: диски, % зайнято (D: — дані і журнали SQL, E: — бекапи і вивантаження)",
+         [("D:", hourly(disks, "sim-2", "used_pct", "D:")), ("E:", hourly(disks, "sim-2", "used_pct", "E:"))],
+         "sim-2", False),
     ]
     colors = scenario_colors()
+    line_colors = ["#333333", "#7a7a7a"]
 
     fig, axes = plt.subplots(len(panels), 1, figsize=(15, 19), sharex=True)
     start, end = metrics["ts"].min(), metrics["ts"].max()
-    for ax, (title, series, server, show_weekends) in zip(axes, panels):
-        ax.plot(series.index, series.values, color="#333333", linewidth=0.9)
+    for ax, (title, lines, server, show_weekends) in zip(axes, panels):
+        for (label, series), line_color in zip(lines, line_colors):
+            ax.plot(series.index, series.values, color=line_color, linewidth=0.9,
+                    linestyle="-" if line_color == line_colors[0] else "--")
+        if len(lines) > 1:
+            for (label, series), line_color in zip(lines, line_colors):
+                ax.annotate(label, (series.index[-1], series.values[-1]), xytext=(4, 0),
+                            textcoords="offset points", fontsize=9, color=line_color, va="center")
         ax.set_title(title, loc="left", fontsize=10)
         ax.grid(alpha=0.3)
         if show_weekends:   # вихідні за місцевим часом — сірим фоном
@@ -776,9 +882,21 @@ def plot_history() -> None:
 
 
 def scenario_colors() -> dict:
-    """Сталий колір для кожного типу інциденту (однаковий на всіх графіках)."""
-    import matplotlib.pyplot as plt
-    return dict(zip(sorted(SCENARIOS), plt.get_cmap("tab10").colors))
+    """Сталий колір для кожного типу інциденту (однаковий на всіх графіках).
+
+    Сірого немає: сірим фоном позначено вихідні.
+    """
+    palette = {
+        "cpu_spike": "#d62728",      # червоний
+        "memory_leak": "#8c564b",    # коричневий
+        "disk_fill": "#9467bd",      # фіолетовий
+        "service_stop": "#e377c2",   # рожевий
+        "apppool_crash": "#1f77b4",  # синій
+        "site_down": "#17becf",      # бірюзовий
+        "cert_expiring": "#2ca02c",  # зелений
+        "backup_stale": "#ff7f0e",   # помаранчевий
+    }
+    return {name: palette.get(name, "#bcbd22") for name in SCENARIOS}
 
 
 # ---------------------------------------------------------------------------
@@ -803,17 +921,16 @@ def list_incidents() -> None:
         return t.strftime("%d.%m %a %H:%M")
 
     print(f"Інцидентів: {len(rows)}. Час місцевий (UTC+{tz.seconds // 3600}); у базі — UTC.")
-    print(f"  {'id':>4}  {'сервер':<7}{'тип':<15}{'початок':<17}{'кінець':<17}{'тривалість':>11}")
+    print(f"  {'id':>4}  {'сервер':<7}{'тип':<15}{'початок':<17}{'кінець':<17}{'тривалість':>16}")
     for row in rows:
         if row["ended_at"]:
             s = datetime.strptime(row["started_at"], TS_FORMAT)
             e = datetime.strptime(row["ended_at"], TS_FORMAT)
-            minutes = int((e - s).total_seconds() // 60)
-            duration = f"{minutes // 1440} д {minutes % 1440 // 60} год" if minutes >= 1440 else f"{minutes} хв"
+            duration = fmt_duration(int((e - s).total_seconds() // 60))
         else:
             duration = "—"
         print(f"  {row['id']:>4}  {row['server']:<7}{row['scenario']:<15}"
-              f"{local(row['started_at']):<17}{local(row['ended_at']):<17}{duration:>11}")
+              f"{local(row['started_at']):<17}{local(row['ended_at']):<17}{duration:>16}")
     print("\nГрафік інциденту: python -m simulator.simulator --plot-incident <id>")
 
 
@@ -845,8 +962,22 @@ def plot_incident(incident_id: int) -> None:
                             conn, params=params)
         checks = pd.read_sql("SELECT ts, check_type, ok, value FROM checks WHERE server_id = ? AND ts BETWEEN ? AND ?",
                              conn, params=params)
+        # Погодинні перевірки (бекап, сертифікат): останнє значення ПЕРЕД вікном,
+        # щоб лінія починалась від лівого краю графіка
+        before = pd.read_sql(
+            "SELECT ? AS ts, check_type, ok, value FROM checks c WHERE server_id = ? AND check_type IN ('backup', 'cert') "
+            "AND ts = (SELECT MAX(ts) FROM checks WHERE server_id = c.server_id AND check_type = c.check_type AND ts < ?)",
+            conn, params=(params[1], inc["server_id"], params[1]))
+        checks = pd.concat([before, checks], ignore_index=True)
         events = pd.read_sql("SELECT ts, event_id, level, source FROM events WHERE server_id = ? AND ts BETWEEN ? AND ?",
                              conn, params=params)
+        # Стан служб і пулів: записи у вікні + останній стан перед вікном
+        services = pd.read_sql(
+            "SELECT ts, name, status FROM service_status WHERE server_id = ? AND ts BETWEEN ? AND ? "
+            "UNION ALL "
+            "SELECT ? AS ts, name, status FROM service_status s WHERE server_id = ? AND ts = "
+            "(SELECT MAX(ts) FROM service_status WHERE server_id = s.server_id AND name = s.name AND ts < ?)",
+            conn, params=params + (params[1], inc["server_id"], params[1]))
         # Інші інциденти на цьому сервері, що потрапляють у вікно (ланцюжки)
         others = pd.read_sql(
             "SELECT id, scenario, started_at, ended_at FROM sim_incidents WHERE server_id = ? AND id != ? "
@@ -884,12 +1015,28 @@ def plot_incident(incident_id: int) -> None:
             s = part.assign(t=to_local(part["ts"])).set_index("t")["value"]
             panels.append((title, [(check_type, s)]))
 
+    panels.append(("Служби і пули: зелене — працює, червоне — зупинено", "services"))
+
     colors = scenario_colors()
     level_color = {"Error": "#c0392b", "Warning": "#e67e22", "Information": "#7f8c8d"}
+    loc_win_to = win_to.tz_convert(None) + tz
 
     fig, axes = plt.subplots(len(panels), 1, figsize=(14, 2.6 * len(panels) + 1), sharex=True)
     for ax, panel in zip(axes, panels):
         title, lines = panel[0], panel[1]
+        if lines == "services":
+            # Кожна служба — рядок; стан діє від свого запису до наступного
+            names = sorted(services["name"].unique())
+            for row, name in enumerate(names):
+                part = services[services["name"] == name].assign(t=lambda d: to_local(d["ts"])).sort_values("t")
+                times, statuses = list(part["t"]), list(part["status"])
+                for i, (t0, status) in enumerate(zip(times, statuses)):
+                    t1 = times[i + 1] if i + 1 < len(times) else loc_win_to
+                    ax.broken_barh([(t0, t1 - t0)], (row - 0.35, 0.7),
+                                   color="#2ecc71" if status == "running" else "#e74c3c", linewidth=0)
+            ax.set_yticks(range(len(names)), names, fontsize=8)
+            ax.set_ylim(-0.6, len(names) - 0.4)
+            lines = []
         for label, series in lines:
             ax.plot(series.index, series.values, linewidth=1, label=label,
                     drawstyle="steps-post" if label in ("backup", "cert") else "default")
@@ -898,10 +1045,12 @@ def plot_incident(incident_id: int) -> None:
             fail_t = to_local(fails["ts"]).dt.floor("min")
             y = lines[0][1].reindex(fail_t).values
             ax.scatter(fail_t, y, color="#c0392b", s=10, zorder=3, label="HTTP-перевірка не пройшла")
-        ax.set_title(title, loc="left", fontsize=10)
+        # Заголовок — всередині панелі, щоб над верхньою панеллю було місце для підписів подій
+        ax.text(0.005, 0.97, title, transform=ax.transAxes, fontsize=9, va="top", ha="left", zorder=5,
+                bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none", "pad": 2})
         ax.grid(alpha=0.3)
         if len(lines) > 1 or len(panel) > 2:
-            ax.legend(loc="upper left", fontsize=8)
+            ax.legend(loc="upper right", fontsize=8)
         # Сам інцидент і пов'язані з ним
         ax.axvspan(loc_start, loc_end, color=colors[inc["scenario"]], alpha=0.25, linewidth=0)
         for _, o in others.iterrows():
@@ -916,13 +1065,25 @@ def plot_incident(incident_id: int) -> None:
     # Вісь — рівно вікно ±2 год (смуги пов'язаних інцидентів можуть бути довшими)
     axes[0].set_xlim(win_from.tz_convert(None) + tz, win_to.tz_convert(None) + tz)
 
-    # Підписи подій над першою панеллю
+    # Підписи подій над першою панеллю. Близькі в часі події об'єднуємо
+    # в один підпис («1000/5009/5002»), щоб текст не накладався
     top = axes[0]
-    for _, ev in events.iterrows():
+    gap = (win_to - win_from) / 100
+    groups = []   # [час першої події, [номери], найсерйозніший рівень]
+    severity = {"Error": 2, "Warning": 1}
+    for _, ev in events.sort_values("ts").iterrows():
         ev_t = pd.Timestamp(ev["ts"]).tz_convert(None) + tz
-        top.annotate(str(ev["event_id"]), (ev_t, 1.0), xycoords=("data", "axes fraction"),
+        if groups and ev_t - groups[-1][0] <= gap:
+            if str(ev["event_id"]) not in groups[-1][1]:
+                groups[-1][1].append(str(ev["event_id"]))
+            if severity.get(ev["level"], 0) > severity.get(groups[-1][2], 0):
+                groups[-1][2] = ev["level"]
+        else:
+            groups.append([ev_t, [str(ev["event_id"])], ev["level"]])
+    for ev_t, ids, level in groups:
+        top.annotate("/".join(ids), (ev_t, 1.0), xycoords=("data", "axes fraction"),
                      xytext=(0, 2), textcoords="offset points", rotation=90, fontsize=7,
-                     ha="center", va="bottom", color=level_color.get(ev["level"], "#7f8c8d"))
+                     ha="center", va="bottom", color=level_color.get(level, "#7f8c8d"))
 
     chain = ", ".join(f"#{o['id']} {o['scenario']}" for _, o in others.iterrows())
     fig.suptitle(f"Інцидент #{incident_id}: {inc['scenario']} на {inc['server']}, "
@@ -938,6 +1099,148 @@ def plot_incident(incident_id: int) -> None:
     print(f"Графік збережено: {path}")
 
 
+def incident_details(incident_id: int) -> None:
+    """Подробиці інциденту: «ключ відповідей» і те, що видно в сирих даних.
+
+    Перший блок береться з sim_incidents.params_json (знає лише симулятор).
+    Решта — лише з таблиць, які заповнює і справжній агент: саме це побачать
+    аналізатор і бот. Так можна перевірити, чи з даних видно причину.
+    """
+    tz = timedelta(hours=load_profiles()["timezone_offset_hours"])
+
+    def parse(ts):
+        return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc)
+
+    def local(ts):
+        return (parse(ts) + tz).strftime("%d.%m %H:%M")
+
+    with db_session() as conn:
+        inc = conn.execute("SELECT i.*, s.name AS server FROM sim_incidents i JOIN servers s ON s.id = i.server_id "
+                           "WHERE i.id = ?", (incident_id,)).fetchone()
+        if inc is None:
+            print(f"Інциденту з id = {incident_id} немає. Список: python -m simulator.simulator --incidents")
+            return
+        sid, scenario = inc["server_id"], inc["scenario"]
+        start = inc["started_at"]
+        end = inc["ended_at"] or fmt(datetime.now(timezone.utc))
+        params = json.loads(inc["params_json"] or "{}")
+        duration = fmt_duration(int((parse(end) - parse(start)).total_seconds() // 60))
+
+        print(f"Інцидент #{incident_id}: {scenario} на {inc['server']}, "
+              f"{local(start)} – {local(end)} (місц.), {duration}")
+        print("\n[Ключ відповідей — params_json, бот цього не бачить]")
+        for key, value in params.items():
+            print(f"  {key:<14} {value}")
+
+        # --- Пік: момент, коли інцидент видно найкраще ---
+        peak_sql = {
+            "cpu_spike": "SELECT ts FROM metrics WHERE server_id=? AND ts>=? AND ts<? AND cpu_pct<=100 "
+                         "ORDER BY cpu_pct DESC LIMIT 1",
+            "memory_leak": "SELECT ts FROM metrics WHERE server_id=? AND ts>=? AND ts<? AND ram_pct<=100 "
+                           "ORDER BY ram_pct DESC LIMIT 1",
+            "disk_fill": "SELECT ts FROM disk_usage WHERE server_id=? AND ts>=? AND ts<? "
+                         "ORDER BY used_pct DESC LIMIT 1",
+        }
+        if scenario in peak_sql:
+            row = conn.execute(peak_sql[scenario], (sid, start, end)).fetchone()
+            peak = row["ts"] if row else start
+            how = "максимум показника"
+        else:
+            peak = fmt(parse(start) + min(timedelta(minutes=5), (parse(end) - parse(start)) / 2))
+            how = "через кілька хвилин після початку"
+        m = conn.execute("SELECT * FROM metrics WHERE server_id=? AND ts<=? AND cpu_pct<=100 AND ram_pct<=100 "
+                         "ORDER BY ts DESC LIMIT 1", (sid, peak)).fetchone()
+        print(f"\n[Пік: {local(peak)} — {how}]")
+        if m:
+            site = (f", сайт {m['app_response_ms']:.0f} мс, помилок {m['app_error_pct']:.1f} %"
+                    if m["app_response_ms"] is not None else "")
+            print(f"  CPU {m['cpu_pct']:.1f} %, RAM {m['ram_pct']:.1f} %{site}")
+
+        # --- Процеси: на піку проти години до інциденту ---
+        def snapshot(at, not_before=None):
+            """Останній знімок процесів не пізніше at (і, якщо задано, не раніше not_before).
+            Якщо такого немає — перший знімок після not_before (знімки раз на 5 хв)."""
+            ts_row = conn.execute("SELECT MAX(ts) AS ts FROM process_snapshots WHERE server_id=? AND ts<=? "
+                                  "AND ts>=?", (sid, at, not_before or "")).fetchone()
+            if (not ts_row or ts_row["ts"] is None) and not_before:
+                ts_row = conn.execute("SELECT MIN(ts) AS ts FROM process_snapshots WHERE server_id=? AND ts>=? "
+                                      "AND ts<?", (sid, not_before, end)).fetchone()
+            if not ts_row or ts_row["ts"] is None:
+                return None, []
+            rows = conn.execute("SELECT name, pid, cpu_pct, ram_mb, app_pool FROM process_snapshots "
+                                "WHERE server_id=? AND ts=? ORDER BY cpu_pct DESC", (sid, ts_row["ts"])).fetchall()
+            return ts_row["ts"], rows
+
+        before_ts, before = snapshot(fmt(parse(start) - timedelta(hours=1)))
+        peak_ts, top = snapshot(peak, not_before=start)
+        before_by_key = {(p["name"], p["app_pool"]): p for p in before}
+        print(f"\n[Топ-5 процесів на піку (знімок {local(peak_ts) if peak_ts else '—'}) "
+              f"проти години до інциденту (знімок {local(before_ts) if before_ts else '—'})]")
+        print(f"  {'процес':<16}{'пул':<10}{'PID':>7}{'CPU, %':>9}{'(до)':>7}{'RAM, МБ':>10}{'(до)':>9}")
+        for p in top:
+            b = before_by_key.get((p["name"], p["app_pool"]))
+            print(f"  {p['name']:<16}{(p['app_pool'] or '—'):<10}{p['pid']:>7}{p['cpu_pct']:>9.1f}"
+                  f"{(f'{b['cpu_pct']:.1f}' if b else '—'):>7}{p['ram_mb']:>10.0f}"
+                  f"{(f'{b['ram_mb']:.0f}' if b else '—'):>9}")
+        missing = [k for k in before_by_key if k not in {(p["name"], p["app_pool"]) for p in top}]
+        if missing:
+            print("  зникли з топу: " + ", ".join(f"{n}" + (f" ({pool})" if pool else "") for n, pool in missing))
+
+        # --- Теки: найбільший приріст ---
+        folders = conn.execute(
+            "SELECT path, "
+            " (SELECT size_gb FROM folder_sizes f2 WHERE f2.server_id=f.server_id AND f2.path=f.path AND f2.ts<=? "
+            "  ORDER BY ts DESC LIMIT 1) AS before_gb, "
+            " MAX(size_gb) AS max_gb "
+            "FROM folder_sizes f WHERE server_id=? AND ts>=? AND ts<? GROUP BY path",
+            (start, sid, start, end)).fetchall()
+        print("\n[Теки: приріст під час інциденту (знімки щогодини)]")
+        if not folders:
+            print("  інцидент коротший за годину — погодинних знімків тек у ньому немає")
+        growth = sorted(((f["path"], f["before_gb"] or 0, f["max_gb"]) for f in folders),
+                        key=lambda x: x[2] - x[1], reverse=True)
+        for path, before_gb, max_gb in growth[:3]:
+            print(f"  {path:<28} {before_gb:>8.1f} -> {max_gb:>8.1f} ГБ  (+{max_gb - before_gb:.1f})")
+        disks = conn.execute("SELECT drive, used_pct, free_gb FROM disk_usage WHERE server_id=? AND ts = "
+                             "(SELECT MAX(ts) FROM disk_usage WHERE server_id=? AND ts<=?)", (sid, sid, peak)).fetchall()
+        print("  диски на піку: " + ", ".join(f"{d['drive']} {d['used_pct']:.1f} % (вільно {d['free_gb']:.0f} ГБ)"
+                                              for d in disks))
+
+        # --- Служби і пули ---
+        statuses = conn.execute("SELECT name, kind, status FROM service_status s WHERE server_id=? AND ts = "
+                                "(SELECT MAX(ts) FROM service_status WHERE server_id=s.server_id AND name=s.name "
+                                "AND ts<=?)", (sid, peak)).fetchall()
+        print("\n[Служби і пули на піку]")
+        print("  " + ", ".join(f"{s['name']} ({s['kind']}): {s['status']}" for s in statuses))
+        changes, last = [], {}
+        for s in conn.execute("SELECT ts, name, status FROM service_status WHERE server_id=? AND ts>=? AND ts<=? "
+                              "ORDER BY ts", (sid, fmt(parse(start) - timedelta(minutes=10)),
+                                              fmt(parse(end) + timedelta(minutes=10)))):
+            if s["name"] in last and last[s["name"]] != s["status"]:
+                changes.append(f"{local(s['ts'])} {s['name']}: {last[s['name']]} -> {s['status']}")
+            last[s["name"]] = s["status"]
+        print("  зміни стану: " + ("; ".join(changes) if changes else "немає"))
+
+        # --- Перевірки ---
+        chk = conn.execute(
+            "SELECT check_type, COUNT(*) AS n, SUM(ok=0) AS failed, MIN(value) AS vmin, MAX(value) AS vmax "
+            "FROM checks WHERE server_id=? AND ts>=? AND ts<? GROUP BY check_type", (sid, start, end)).fetchall()
+        print("\n[Перевірки під час інциденту]")
+        units = {"http": "мс", "sql_port": "мс", "cert": "днів", "backup": "год"}
+        for c in chk:
+            print(f"  {c['check_type']:<9} не пройшли {c['failed']} з {c['n']}; "
+                  f"значення {c['vmin']:.1f}–{c['vmax']:.1f} {units.get(c['check_type'], '')}")
+
+        # --- Події журналу ---
+        events = conn.execute("SELECT ts, log, source, event_id, level, message FROM events "
+                              "WHERE server_id=? AND ts>=? AND ts<=? ORDER BY ts",
+                              (sid, start, fmt(parse(end) + timedelta(minutes=1)))).fetchall()
+        print(f"\n[Події журналу ({len(events)})]")
+        for e in events:
+            text = e["message"] if len(e["message"]) <= 150 else e["message"][:147] + "..."
+            print(f"  {local(e['ts'])} {e['level']:<11} {e['source']} {e['event_id']}: {text}")
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -949,6 +1252,8 @@ def main() -> int:
     parser.add_argument("--incidents", action="store_true", help="список інцидентів з sim_incidents")
     parser.add_argument("--plot-incident", type=int, metavar="ID",
                         help="графік одного інциденту (±2 год) у docs/experiments/incident_<id>.png")
+    parser.add_argument("--details", type=int, metavar="ID",
+                        help="подробиці інциденту: ключ відповідей і що видно в даних")
     parser.add_argument("--live", action="store_true", help="живий потік (крок 1.6)")
     parser.add_argument("--scenario", help="запустити сценарій (крок 1.7)")
     args = parser.parse_args()
@@ -976,8 +1281,11 @@ def main() -> int:
         list_incidents()
     if args.plot_incident is not None:
         plot_incident(args.plot_incident)
+    if args.details is not None:
+        incident_details(args.details)
 
-    if not (args.history or args.plot or args.reset or args.incidents or args.plot_incident is not None):
+    if not (args.history or args.plot or args.reset or args.incidents
+            or args.plot_incident is not None or args.details is not None):
         parser.print_help()
     return 0
 

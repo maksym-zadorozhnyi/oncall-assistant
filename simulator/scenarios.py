@@ -63,6 +63,8 @@ class CpuSpike(Scenario):
         if values.get("http"):
             values["http"]["response_ms"] *= 1.8
         t = self.target(state, self.name)
+        params.setdefault("process", t.get("process"))     # для «ключа відповідей»
+        params.setdefault("app_pool", t.get("app_pool"))
         values["process_overrides"].append({
             "name": t.get("process"), "app_pool": t.get("app_pool"),
             "cpu_pct": values["cpu_pct"] * rng.uniform(0.75, 0.85),
@@ -87,6 +89,8 @@ class MemoryLeak(Scenario):
         extra_pct = leak_level - params["start_ram"]
 
         t = self.target(state, self.name)
+        params.setdefault("process", t.get("process"))     # для «ключа відповідей»
+        params.setdefault("app_pool", t.get("app_pool"))
         values["process_overrides"].append({
             "name": t.get("process"), "app_pool": t.get("app_pool"),
             "ram_add_mb": extra_pct / 100 * state.profile["ram_total_gb"] * 1024,
@@ -123,15 +127,21 @@ class DiskFill(Scenario):
             folder = params.get("folder") or self.target(state, self.name)["folder"]
             drive = state.folder_drive(folder)
             free_to_target = 0.93 * state.drive_total_gb(drive) - state.drive_used_gb(drive)
+            # fill_minutes — за скільки хвилин дійти до ~93 % (за замовчуванням —
+            # уся тривалість інциденту); у ланцюжку з бекапом — коротше
+            fill_minutes = params.get("fill_minutes") or params["duration_min"]
             params.update({
                 "folder": folder,
                 "drive": drive,
-                # Щоб до кінця інциденту дійти до ~93 %
-                "rate_gb_per_min": max(free_to_target, 1) / max(params["duration_min"], 1),
+                "fill_minutes": fill_minutes,
+                "target_gb": max(free_to_target, 1),
+                "rate_gb_per_min": max(free_to_target, 1) / max(fill_minutes, 1),
                 "added_gb": 0.0,
                 "warned": False,
             })
-        step = params["rate_gb_per_min"] * rng.uniform(0.7, 1.3)
+        # Росте, поки не досягне цілі, далі тримається на ~93 % до «прибирання»
+        step = min(params["rate_gb_per_min"] * rng.uniform(0.7, 1.3),
+                   max(params["target_gb"] - params["added_gb"], 0))
         state.folder_gb[params["folder"]] += step
         params["added_gb"] += step
         values["disk_write_mbs"] += step * 1024 / 60   # ГБ/хв -> МБ/с
@@ -232,19 +242,26 @@ class ApppoolCrash(Scenario):
 
 
 class SiteDown(Scenario):
-    """Сайт відповідає помилкою 500 або дуже повільно (> 2 с), пули працюють."""
+    """Сайт недоступний, хоча пули працюють (наприклад, застосунок втратив зв'язок з БД).
+
+    Варіанти:
+        error — повна недоступність: кожен запит отримує 500, помилок 90–100 %;
+        slow  — сторінки відкриваються, але довше 2 с: перевірки падають
+                за таймаутом, а помилок мало (2–5 %).
+    """
     name = "site_down"
     duration_min = (5, 30)
 
     def start(self, state, params, rng):
-        params["variant"] = rng.choice(["error", "slow"])
+        if not params.get("variant"):
+            params["variant"] = rng.choice(["error", "slow"])
         return []
 
     def apply(self, state, values, minute, params, rng):
         http = values.get("http")
         if params["variant"] == "error":
-            values["app_response_ms"] = rng.uniform(200, 600)
-            values["app_error_pct"] = rng.uniform(15, 40)
+            values["app_response_ms"] = rng.uniform(50, 300)   # помилка повертається швидко
+            values["app_error_pct"] = rng.uniform(90, 100)
             if http:
                 http["code"] = 500
                 http["response_ms"] = values["app_response_ms"]
@@ -270,6 +287,11 @@ class BackupStale(Scenario):
     duration_min = (24 * 60 + 40, 24 * 60 + 40)
 
     def start(self, state, params, rng):
+        if params.get("reason") == "no_space":
+            # Ланцюжок «диск → бекап»: диск уже заповнений, нічний бекап
+            # не поміститься і впаде сам (події 18210 і 3041 пише simulator.py).
+            # Сценарій лише позначає інцидент у «ключі відповідей»
+            return []
         state.backup_fail_next = True    # найближчий нічний бекап не запуститься
         state.last_backup_ok = False
         if params.get("live") and state.last_backup_end is not None:

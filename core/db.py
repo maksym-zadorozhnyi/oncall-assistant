@@ -108,8 +108,9 @@ CREATE TABLE IF NOT EXISTS sim_incidents (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id  INTEGER NOT NULL REFERENCES servers(id),
     scenario   TEXT NOT NULL,                   -- disk_fill / cpu_spike / ...
-    started_at TEXT NOT NULL,
-    ended_at   TEXT                             -- NULL, поки сценарій триває
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT,                           -- NULL, поки сценарій триває
+    params_json TEXT                            -- параметри сценарію (служба, пул, тека...)
 );
 
 -- ===== Оброблені дані (пишуть ETL і аналізатор) =====

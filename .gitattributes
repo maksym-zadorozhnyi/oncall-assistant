@@ -1,0 +1,14 @@
+# Однакові кінці рядків у репозиторії незалежно від налаштувань Git на машині.
+# Текстові файли — LF (потрібно для Docker / Linux), скрипти Windows — CRLF.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Двійкові файли — без перетворень
+*.png binary
+*.jpg binary
+*.pdf binary
+*.xlsx binary
+*.db binary

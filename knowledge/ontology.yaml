@@ -203,7 +203,18 @@ event_codes:
     log: Application
     source: MSSQLSERVER
     indicates: backup_missing
-    meaning: команду BACKUP не завершено (резервну копію не створено)
+    meaning: команду BACKUP не завершено (резервну копію не створено); причини не містить
+
+  # Причину збою бекапу SQL Server пише окремою подією перед 3041
+  - id: 18210
+    log: Application
+    source: MSSQLSERVER
+    meaning: помилка запису на пристрій бекапу (BackupIoRequest::ReportIoError) з кодом помилки ОС
+    indicates:
+      - incident: backup_missing
+        when: завжди — бекап не записано
+      - incident: disk_fill
+        when: у тексті «Operating system error 112» (немає місця на диску)
 
   # Збої процесів: на який інцидент вказують — залежить від того,
   # який процес упав (його назва є в тексті події)

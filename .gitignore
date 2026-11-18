@@ -17,6 +17,10 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
+# Графіки окремих інцидентів: номери змінюються після кожного --reset,
+# тому будуємо їх командою --plot-incident, коли потрібно
+docs/experiments/incident_*.png
+
 # Векторна база ChromaDB (перебудовується з knowledge/runbooks)
 data/chroma/
 

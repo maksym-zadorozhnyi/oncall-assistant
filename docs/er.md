@@ -76,6 +76,7 @@ erDiagram
         TEXT scenario
         TEXT started_at
         TEXT ended_at
+        TEXT params_json
     }
     metrics_clean {
         TEXT ts PK

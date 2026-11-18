@@ -65,12 +65,13 @@ servers:
       cert: {subject: "CN=portal.example.com", normal_days_left: 200}
 
     # Скільки окремих інцидентів кожного типу вбудувати в історію
+    # («тип: кількість» або «тип: {count: N, params: {...}}» — з фіксованими параметрами)
     history_incidents:
       cpu_spike: 2
       memory_leak: 1
       disk_fill: 2
       service_stop: 1
-      apppool_crash: 1
+      apppool_crash: {count: 1, params: {pool: SitePool}}   # у ланцюжках падає ApiPool
       site_down: 3
       cert_expiring: 1
 
