@@ -1,0 +1,173 @@
+# Профілі симульованих серверів.
+#
+# Усі назви вигадані й нейтральні; домени — лише *.example.com.
+# Відсотки — у %, швидкості — у МБ/с, розміри — у ГБ, час — місцевий (UTC+2).
+#
+# Навантаження протягом доби: вночі значення "night", у робочий час
+# піднімається до "day_peak" (найвище близько 14:30); у вихідні
+# денна частина множиться на weekend_factor.
+
+timezone_offset_hours: 2       # місцевий час = UTC + 2 (без літнього часу)
+
+servers:
+
+  # ---------------------------------------------------------------------
+  sim-1:
+    role: web
+    description: "Вебсервер IIS: сайт portal.example.com, пули SitePool і ApiPool (симуляція)"
+    ram_total_gb: 16
+
+    cpu:      {night: 10, day_peak: 55, weekend_factor: 0.5, noise: 3}
+    ram:      {base: 58, load_gain: 10, noise: 1.0}
+    disk_io:  {read_peak: 6, write_peak: 4}        # МБ/с у пік
+    net:      {in_peak: 12, out_peak: 30}          # МБ/с у пік
+    app:      {response_base_ms: 120, response_load_ms: 120, error_pct: 0.3}
+
+    # other_gb — усе на диску, крім тек, що відстежуються нижче
+    drives:
+      "C:": {total_gb: 120, other_gb: 70, growth_gb_per_day: 0.05}
+      "D:": {total_gb: 200, other_gb: 60, growth_gb_per_day: 0.0}
+
+    folders:
+      - path: 'D:\inetpub\logs\LogFiles'
+        drive: "D:"
+        start_gb: 10
+        weekday_gb_per_day: 3.0          # у будні логів більше
+        weekend_gb_per_day: 1.2
+        weekly_cleanup: {weekday: 6, hour: 3, keep_gb: 2}   # неділя 03:00
+      - path: 'D:\inetpub\wwwroot'
+        drive: "D:"
+        start_gb: 4
+      - path: 'C:\Windows\Temp'
+        drive: "C:"
+        start_gb: 1.5
+        weekday_gb_per_day: 0.02
+        weekend_gb_per_day: 0.02
+
+    services:
+      - {name: W3SVC, kind: service}
+      - {name: WAS, kind: service}
+      - {name: PortalSyncService, kind: service}
+      - {name: SitePool, kind: apppool}
+      - {name: ApiPool, kind: apppool}
+
+    # cpu_share — частка загального CPU сервера, яку займає процес
+    processes:
+      - {name: w3wp.exe, app_pool: SitePool, cpu_share: 0.45, ram_mb: 900}
+      - {name: w3wp.exe, app_pool: ApiPool, cpu_share: 0.30, ram_mb: 650}
+      - {name: PortalSync.exe, service: PortalSyncService, cpu_share: 0.05, ram_mb: 180}
+      - {name: MsMpEng.exe, cpu_share: 0.06, ram_mb: 250}
+      - {name: svchost.exe, cpu_share: 0.04, ram_mb: 120}
+      - {name: lsass.exe, cpu_share: 0.02, ram_mb: 60}
+
+    checks:
+      http: {url: "https://portal.example.com/health", app_pool: SitePool, timeout_ms: 2000}
+      cert: {subject: "CN=portal.example.com", normal_days_left: 200}
+
+    # Скільки окремих інцидентів кожного типу вбудувати в історію
+    history_incidents:
+      cpu_spike: 2
+      memory_leak: 1
+      disk_fill: 2
+      service_stop: 1
+      apppool_crash: 1
+      site_down: 3
+      cert_expiring: 1
+
+    # Ланцюжки, що накладаються: причина -> наслідок (як can_cause в онтології).
+    # Витік пам'яті в ApiPool наприкінці валить цей самий пул.
+    history_chains:
+      - {cause: memory_leak, effect: apppool_crash, count: 2, effect_params: {pool: ApiPool}}
+
+    # Що саме ламають сценарії на цьому сервері
+    scenario_targets:
+      cpu_spike: {process: w3wp.exe, app_pool: ApiPool}
+      memory_leak: {process: w3wp.exe, app_pool: ApiPool}
+      disk_fill: {folder: 'D:\inetpub\logs\LogFiles'}
+      service_stop: {service: PortalSyncService}
+      apppool_crash: {pools: [SitePool, ApiPool]}
+
+  # ---------------------------------------------------------------------
+  sim-2:
+    role: db
+    description: "Сервер БД: SQL Server, база AppDb, нічний бекап о 02:00 (симуляція)"
+    ram_total_gb: 64
+
+    cpu:      {night: 8, day_peak: 38, weekend_factor: 0.5, noise: 2.5}
+    ram:      {base: 79, load_gain: 4, noise: 0.8}
+    disk_io:  {read_peak: 25, write_peak: 10}
+    net:      {in_peak: 15, out_peak: 20}
+    # app відсутній: на сервері БД немає сайту, app_* лишаються порожніми
+
+    drives:
+      "C:": {total_gb: 120, other_gb: 64, growth_gb_per_day: 0.03}
+      "D:": {total_gb: 600, other_gb: 10, growth_gb_per_day: 0.0}
+      "E:": {total_gb: 500, other_gb: 10, growth_gb_per_day: 0.0}
+
+    folders:
+      - path: 'D:\SQLData'
+        drive: "D:"
+        start_gb: 300
+        weekday_gb_per_day: 0.6          # база росте в робочі дні
+        weekend_gb_per_day: 0.1
+      - path: 'D:\SQLLogs'
+        drive: "D:"
+        start_gb: 20
+      - path: 'E:\Backup'
+        drive: "E:"
+        start_gb: 0                      # рахується з переліку бекапів
+      - path: 'E:\Exports'
+        drive: "E:"
+        start_gb: 5                      # вивантаження даних; у ланцюжку заповнює E:
+      - path: 'C:\Windows\Temp'
+        drive: "C:"
+        start_gb: 2
+        weekday_gb_per_day: 0.02
+        weekend_gb_per_day: 0.02
+
+    services:
+      - {name: MSSQLSERVER, kind: service}
+      - {name: SQLSERVERAGENT, kind: service}
+      - {name: SQLWriter, kind: service}
+
+    processes:
+      - {name: sqlservr.exe, service: MSSQLSERVER, cpu_share: 0.75, ram_mb: 48000}
+      - {name: SQLAGENT.EXE, service: SQLSERVERAGENT, cpu_share: 0.03, ram_mb: 150}
+      - {name: sqlwriter.exe, service: SQLWriter, cpu_share: 0.01, ram_mb: 20}
+      - {name: MsMpEng.exe, cpu_share: 0.06, ram_mb: 250}
+      - {name: svchost.exe, cpu_share: 0.04, ram_mb: 130}
+      - {name: lsass.exe, cpu_share: 0.02, ram_mb: 60}
+
+    backup:
+      database: AppDb
+      folder: 'E:\Backup'
+      hour: 2                  # місцевий час
+      duration_min: 40
+      size_ratio: 0.15         # розмір бекапу = 15 % від D:\SQLData
+      data_folder: 'D:\SQLData'
+      retention_days: 7
+      cleanup_hour: 6          # старі бекапи видаляє окреме завдання о 06:00
+      cpu_add: 25              # додаткове навантаження під час бекапу
+      read_mbs: 150
+      write_mbs: 120
+
+    checks:
+      sql_port: {port: 1433}
+      backup: {}
+
+    history_incidents:
+      cpu_spike: 2
+      memory_leak: 1
+      disk_fill: 1
+      service_stop: 2
+      backup_stale: 1
+
+    # Вивантаження заповнює E: увечері -> нічний бекап о 02:00 не вдається.
+    history_chains:
+      - {cause: disk_fill, effect: backup_stale, count: 1, cause_params: {folder: 'E:\Exports'}}
+
+    scenario_targets:
+      cpu_spike: {process: sqlservr.exe}
+      memory_leak: {process: sqlservr.exe}
+      disk_fill: {folder: 'D:\SQLLogs'}     # некерований ріст журналу транзакцій
+      service_stop: {service: SQLSERVERAGENT}

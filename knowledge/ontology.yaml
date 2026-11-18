@@ -5,7 +5,8 @@
 #   classes        — які поняття є в системі
 #   relations      — які зв'язки між ними можливі (з чого → у що)
 #   incident_types — 8 типів інцидентів: на що впливає, яким правилом
-#                    виявляється, яким ранбуком пояснюється, за якими даними
+#                    виявляється, яким ранбуком пояснюється, за якими даними,
+#                    які інциденти може спричинити (can_cause)
 #   event_codes    — коди подій Windows і на який тип інциденту вони вказують.
 #                    Зазвичай indicates — одна назва інциденту. Якщо подія
 #                    вказує на різні інциденти залежно від обставин,
@@ -57,6 +58,9 @@ relations:
   indicates:
     from: EventCode
     to: [IncidentType]
+  can_cause:                      # один інцидент може спричинити інший
+    from: IncidentType
+    to: [IncidentType]
 
 incident_types:
   disk_fill:
@@ -69,6 +73,7 @@ incident_types:
       - predictions.hours_to_threshold
       - folder_sizes.size_gb
     sim_scenario: disk_fill
+    can_cause: [backup_missing, service_down]   # немає місця для бекапу; SQL зупиняється
 
   cpu_high:
     name: Високе навантаження CPU
@@ -90,6 +95,7 @@ incident_types:
       - process_snapshots.ram_mb
       - events.event_id
     sim_scenario: memory_leak
+    can_cause: [apppool_down, service_down]     # процес падає через брак пам'яті
 
   service_down:
     name: Служба зупинилась
@@ -110,6 +116,7 @@ incident_types:
       - service_status.status
       - events.event_id
     sim_scenario: apppool_crash
+    can_cause: [site_down]                      # сайт на впалому пулі відповідає 503
 
   site_down:
     name: Сайт не відповідає
