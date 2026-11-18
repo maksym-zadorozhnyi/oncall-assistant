@@ -6,7 +6,8 @@
 відповідає на питання за базою знань (ранбуками) через Telegram-бота та
 веб-додаток (Streamlit: дашборд + чат).
 
-Технічне завдання лежить у `docs/tz.pdf`. Термін — приблизно 2 тижні.
+Технічне завдання лежить у `docs/tz.pdf` (лише локально, у Git не
+публікується — див. `.gitignore`). Термін — приблизно 2 тижні.
 
 ## Статус цього файлу
 
@@ -38,7 +39,9 @@
 - На машині також встановлено Python 3.15, тому завжди працюй через `.venv`
   (створений з 3.13), а не через системний `python`.
 - Ключі API лише у `.env` (шаблон — `.env.example`); `.env` у `.gitignore`.
-  Ніколи не вписуй ключі в код. Змінні в `.env`:
+  Ніколи не вписуй ключі в код; модулі читають їх лише через
+  `core/config.py` (`get_setting()`). Перевірка: `python -m core.config`.
+  Змінні в `.env`:
   `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`,
   `TELEGRAM_ALLOWED_IDS` (через кому), `LLM_PROVIDER` (claude або groq),
   `INGEST_API_KEY` (ключ агента для REST API), `DASHBOARD_PASSWORD`
@@ -116,7 +119,7 @@
 agent/        agent.py, config.yaml
 simulator/    simulator.py, scenarios.py
 api/          app.py (FastAPI)
-core/         db.py, etl.py, analyzer.py, ml.py, rules.py, kb.py, llm.py,
+core/         config.py (читання .env), db.py, etl.py, analyzer.py, ml.py, rules.py, kb.py, llm.py,
               stt.py, tts.py, vision.py, emotion.py, assistant.py, charts.py,
               reports.py
 bot/          bot.py
@@ -125,7 +128,7 @@ knowledge/    runbooks/*.md, rules.yaml, ontology.yaml
 data/         oncall.db, datasets/
 notebooks/    експерименти і метрики для записки
 tests/        rag_questions.yaml, тести
-docs/         tz.pdf, milestones.md, progress.md, decisions.md, er.md, experiments/
+docs/         tz.pdf (лише локально), milestones.md, progress.md, decisions.md, er.md, experiments/
 ```
 
 ## Схема БД (SQLite)
