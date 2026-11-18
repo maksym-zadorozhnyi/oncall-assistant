@@ -20,6 +20,10 @@ data/*.db-shm
 # Графіки окремих інцидентів: номери змінюються після кожного --reset,
 # тому будуємо їх командою --plot-incident, коли потрібно
 docs/experiments/incident_*.png
+# Те саме для добових графіків ETL (python -m core.etl --plot) і моментів
+# прогнозу (python -m core.forecast_bench --plot)
+docs/experiments/etl_day_*.png
+docs/experiments/forecast/moment_*.png
 
 # Векторна база ChromaDB (перебудовується з knowledge/runbooks)
 data/chroma/

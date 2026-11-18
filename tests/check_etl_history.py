@@ -101,8 +101,9 @@ def main() -> None:
                   "|---|---|---|---|---|---|"]
         notes = []
         for sid, name in servers.items():
-            cpu = pd.read_sql_query("SELECT ts, value, is_outlier FROM metrics_clean WHERE server_id = ? "
-                                    "AND metric = 'cpu_pct' ORDER BY ts", conn, params=[sid])
+            cpu = pd.read_sql_query("SELECT ts, value, is_imputed, is_outlier FROM metrics_clean "
+                                    "WHERE server_id = ? AND metric = 'cpu_pct' ORDER BY ts",
+                                    conn, params=[sid])
             if cpu.empty:
                 continue
             cpu["ts"] = pd.to_datetime(cpu["ts"], utc=True)
@@ -118,8 +119,10 @@ def main() -> None:
             def label(t):
                 return next((f"{s} #{i}" for a, b, s, i in others if a <= t < b), None)
 
-            # Короткі підйоми >= 70 % у даних (хвилини поспіль, не довше 3 хв)
-            high = cpu["value"] >= 70
+            # Короткі підйоми >= 70 % у даних (хвилини поспіль, не довше 3 хв).
+            # Заповнені хвилини (is_imputed) — не справжні дані: значення між сусідами
+            # після сплеску (напр. 74 % між 90 і 58) подовжило б сплеск на хвилину
+            high = (cpu["value"] >= 70) & (cpu["is_imputed"] == 0)
             run_id = (high != high.shift()).cumsum()
             bursts = [g.index for _, g in cpu[high].groupby(run_id[high])
                       if len(g) <= 3 and not in_spike(g.index[0])]

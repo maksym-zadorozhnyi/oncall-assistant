@@ -101,9 +101,13 @@ erDiagram
         INTEGER server_id FK
         TEXT metric
         TEXT model
+        TEXT kind
         REAL horizon_h
         REAL predicted_value
+        REAL lower_value
+        REAL upper_value
         REAL hours_to_threshold
+        TEXT details_json
     }
     alerts {
         INTEGER id PK

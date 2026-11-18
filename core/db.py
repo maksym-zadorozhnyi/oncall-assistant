@@ -140,14 +140,21 @@ CREATE TABLE IF NOT EXISTS anomalies (
     model      TEXT
 );
 
+-- Прогноз. Один рядок — одна відповідь на одне питання на один горизонт.
+-- kind: trend (тренд, +24 год і +7 днів), fast_growth (незвичний ріст, +1 год),
+-- jump (регулярний стрибок; horizon_h — годин до наступного стрибка).
 CREATE TABLE IF NOT EXISTS predictions (
-    ts                 TEXT NOT NULL,
+    ts                 TEXT NOT NULL,           -- коли зроблено прогноз (UTC)
     server_id          INTEGER NOT NULL REFERENCES servers(id),
-    metric             TEXT NOT NULL,
-    model              TEXT,
+    metric             TEXT NOT NULL,           -- як у metrics_clean: disk_used_pct:C:
+    model              TEXT,                    -- метод: linear, naive, ...
+    kind               TEXT,                    -- trend / fast_growth / jump
     horizon_h          REAL,
     predicted_value    REAL,
-    hours_to_threshold REAL                     -- NULL, якщо поріг не буде досягнуто
+    lower_value        REAL,                    -- межі інтервалу 10–90 %
+    upper_value        REAL,
+    hours_to_threshold REAL,                    -- NULL, якщо поріг не буде досягнуто
+    details_json       TEXT                     -- швидкість, незвичний ріст, наступний стрибок...
 );
 
 CREATE TABLE IF NOT EXISTS alerts (

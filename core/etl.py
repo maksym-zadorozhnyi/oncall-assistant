@@ -417,14 +417,84 @@ def demo() -> None:
     print("\n".join(lines[6:16]))
 
 
+# ---------------------------------------------------------------------------
+# Графік однієї доби реального сервера: сирі точки і результат ETL
+# ---------------------------------------------------------------------------
+
+def plot_day(server: str, day: str, db_path: Path = DB_PATH) -> Path:
+    """PNG за добу day (YYYY-MM-DD, UTC): для кожного показника сирі точки,
+    очищений ряд, відкинуті, заповнені, викиди, довгі пропуски."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    t0 = pd.Timestamp(day, tz="UTC")
+    t1 = t0 + pd.Timedelta(days=1)
+    with db_session(db_path) as conn:
+        row = conn.execute("SELECT id FROM servers WHERE name = ?", (server,)).fetchone()
+        if row is None:
+            raise SystemExit(f"Сервера {server} немає в базі")
+        sid = row["id"]
+        raw, _ = read_raw(conn, sid, t0.strftime(TS_FORMAT))
+        clean = pd.read_sql_query("SELECT ts, metric, value, is_imputed, is_outlier FROM metrics_clean "
+                                  "WHERE server_id = ? AND ts >= ? AND ts < ? ORDER BY ts", conn,
+                                  params=[sid, t0.strftime(TS_FORMAT), t1.strftime(TS_FORMAT)])
+    clean["ts"] = pd.to_datetime(clean["ts"], utc=True)
+    # disk_free_gb дублює disk_used_pct — не малюємо
+    metrics = [m for m in raw if not m.startswith("disk_free_gb")]
+    if not metrics:
+        raise SystemExit(f"За {day} у {server} немає даних")
+
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(12, 1.9 * len(metrics)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, metric in zip(axes, metrics):
+        r = raw[metric]
+        r = r[(r.index >= t0) & (r.index < t1)]
+        c = clean[clean["metric"] == metric].set_index("ts")
+        bad = r[r.notna() & ~possible_mask(metric, r)]
+        ax.plot(r.index, r.values, "o", ms=2, color="#9a9a9a", label="сирі записи")
+        # очищений ряд з розривами на довгих пропусках
+        line = c["value"].reindex(pd.date_range(t0, t1, freq="min", inclusive="left"))
+        ax.plot(line.index, line.values, "-", lw=1.2, color="#2a6fdb", label="metrics_clean")
+        # довгий пропуск — порожні хвилини між першою і останньою точкою доби
+        inside = (line.index >= c.index.min()) & (line.index <= c.index.max()) if not c.empty else False
+        gaps = line.isna() & inside
+        for _, run in line[gaps].groupby((~gaps).cumsum()[gaps]):
+            ax.axvspan(run.index[0], run.index[-1] + pd.Timedelta(minutes=1), color="#d9d9d9", lw=0)
+        imp = c[c["is_imputed"] == 1]
+        out = c[c["is_outlier"] == 1]
+        ax.plot(imp.index, imp["value"], "s", ms=5, mfc="white", mew=1.5, color="#e08a00",
+                label="заповнено")
+        ax.plot(out.index, out["value"], "^", ms=6, color="#c0392b", label="викид")
+        ax.plot(bad.index, bad.values, "x", ms=8, mew=2, color="#c0392b", label="відкинуто")
+        ax.set_title(metric, loc="left", fontsize=9, y=0.82, x=0.005)
+        ax.grid(axis="y", color="#eeeeee")
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    axes[0].legend(loc="upper right", fontsize=7, ncol=5, frameon=False, bbox_to_anchor=(1, 1.35))
+    axes[-1].set_xlabel("час (UTC); сірі смуги — довгі пропуски")
+    fig.suptitle(f"ETL: {server}, {day} (UTC)", x=0.01, ha="left", fontsize=11)
+    fig.tight_layout()
+    png = EXPERIMENTS_DIR / f"etl_day_{server}_{day}.png"
+    EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=110)
+    plt.close(fig)
+    return png
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ETL: сирі дані -> metrics_clean")
     parser.add_argument("--reset", action="store_true", help="перебудувати metrics_clean з нуля")
     parser.add_argument("--demo", action="store_true", help="демо на штучному ряді (тимчасова база)")
+    parser.add_argument("--plot", nargs=2, metavar=("СЕРВЕР", "ДЕНЬ"),
+                        help="PNG за добу (ДЕНЬ = YYYY-MM-DD, UTC): сирі точки і результат ETL")
     args = parser.parse_args()
 
     if args.demo:
         demo()
+        return
+    if args.plot:
+        print(f"Збережено: {plot_day(*args.plot)}")
         return
     result = run_etl(reset=args.reset)
     print_stats(result)

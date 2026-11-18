@@ -135,7 +135,8 @@
 agent/        agent.py, config.yaml
 simulator/    simulator.py, scenarios.py, profiles.yaml (профілі sim-серверів)
 api/          app.py (FastAPI)
-core/         config.py (читання .env), db.py, etl.py, analyzer.py, ml.py, rules.py, kb.py, llm.py,
+core/         config.py (читання .env), db.py, etl.py, forecast.py + forecast.yaml (прогноз диска),
+              forecast_bench.py (стенд перевірки прогнозу), analyzer.py, ml.py, rules.py, kb.py, llm.py,
               stt.py, tts.py, vision.py, emotion.py, assistant.py, charts.py,
               reports.py
 bot/          bot.py
@@ -174,8 +175,10 @@ docs/         tz.pdf (лише локально), milestones.md, progress.md, de
   Пише ETL. Одна метрика — один рядок, тому нова метрика від агента
   не змінює схему
 - `anomalies` — ts, server_id, metric, score, is_anomaly, model
-- `predictions` — ts, server_id, metric, model, horizon_h, predicted_value,
-  hours_to_threshold
+- `predictions` — ts, server_id, metric, model (метод: linear, naive…),
+  kind (trend / fast_growth / jump), horizon_h, predicted_value,
+  lower_value, upper_value, hours_to_threshold, details_json
+  (швидкість, незвичний ріст, наступний стрибок)
 - `alerts` — id, server_id, rule_id, severity, status (open/acked/resolved),
   opened_at, updated_at, notified_at, acked_at, resolved_at, facts_json,
   justification, message (політика алертів — у `docs/milestones.md`)
@@ -199,7 +202,7 @@ awesome-prometheus-alerts.
 
 | Правило | Умова | Критичність |
 |---|---|---|
-| Диск заповнюється | зайнято > 80 % (увага), > 90 % (критично) або до 95 % лишилося < 72 год (увага) / < 24 год (критично) | увага / критично |
+| Диск заповнюється | зайнято > 80 % (увага), > 90 % (критично) або до 90 % лишилося < 72 год (увага) / < 24 год (критично); поріг прогнозу — параметр, за замовчуванням 90 % | увага / критично |
 | Високе CPU | > 90 % протягом 5 хв | увага |
 | Мало пам'яті / витік | > 90 % протягом 5 хв або подія Resource-Exhaustion-Detector 2004 | увага / критично |
 | Служба зупинилась | служба зі списку не працює або події 7031 / 7034 | критично |
