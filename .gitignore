@@ -24,6 +24,9 @@ docs/experiments/incident_*.png
 # прогнозу (python -m core.forecast_bench --plot)
 docs/experiments/etl_day_*.png
 docs/experiments/forecast/moment_*.png
+# Сирі результати стенду прогнозу (~25 МБ на seed): відтворюються командою
+# python -m core.forecast_bench --run; у Git — звіт, графіки і runs.csv
+docs/experiments/forecast/backtest.csv
 
 # Векторна база ChromaDB (перебудовується з knowledge/runbooks)
 data/chroma/

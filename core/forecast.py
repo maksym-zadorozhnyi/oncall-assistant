@@ -117,6 +117,10 @@ def find_steps(used: pd.Series, free: pd.Series, cfg: dict) -> list[dict]:
         j = i
         while j + 1 < len(x) and sign[j + 1] == sign[i]:
             j += 1
+        if j == len(x) - 1:
+            # рівень і досі змінюється — це не завершена сходинка, а ріст (падіння),
+            # що триває; інакше початок швидкого заповнення виглядав би як «стрибок»
+            break
         start, end = x.index[i - 1], x.index[j]
         size_pp = float(x.iloc[j] - x.iloc[i - 1])
         minutes = hours_between(start, end) * 60
@@ -191,8 +195,10 @@ def matches_regular(rise: dict, regular: dict | None, cfg: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def trend(used: pd.Series, free: pd.Series, now: pd.Timestamp, steps: list[dict],
-          regular: dict | None, cfg: dict) -> dict:
-    """Питання 1: тренд від останнього різкого падіння."""
+          regular: dict | None, cfg: dict, fast: dict | None = None) -> dict:
+    """Питання 1: тренд від останнього різкого падіння.
+    Без тимчасового регулярного стрибка і без відрізка незвичного швидкого росту
+    (його описує питання 2)."""
     c, thr = cfg["trend"], cfg["threshold_pct"]
     drops = [s for s in steps if s["size_pp"] < 0]
     start = drops[-1]["end"] if drops else used.index[0]
@@ -214,70 +220,142 @@ def trend(used: pd.Series, free: pd.Series, now: pd.Timestamp, steps: list[dict]
     data = used[used.index > start]
     if excluded:
         data = data[data.index < excluded["from"]]
+    growth_from = fast.get("growth_from") if fast else None
+    if growth_from is not None:
+        data = data[data.index < growth_from]
     hourly = data.resample("1h").mean().dropna()
-    result = {"start": start, "excluded": excluded, "points": len(hourly)}
+    above = float(used.iloc[-1]) >= thr
+    result = {"start": start, "excluded": excluded, "excluded_growth_from": growth_from,
+              "points": len(hourly), "above_threshold_now": above}
     if len(hourly) < c["min_hours"]:
         result["status"] = "мало даних"
+        if above:
+            result["hours_to_threshold"] = 0.0
         return result
 
     t = np.array([hours_between(now, ts + pd.Timedelta(minutes=30)) for ts in hourly.index])
     line = Line(t, hourly.to_numpy())
-    level_now = line.at(0)[0]
+    # Рівень «зараз» для часу до порогу — менший з прямої і факту: одразу після
+    # прибирання (ще не визнаного сходинкою) пряма лишається на старому рівні
+    level_now = min(line.at(0)[0], float(used.iloc[-1]))
     speed_h = line.b
     total_gb = total_size_gb(used, free)
     result.update({
         "status": "ok",
+        "line": line,                 # сама пряма — для графіків (у predictions не пишеться)
         "level_now": level_now,
         "speed_pct_day": speed_h * 24,
         "speed_gb_day": speed_h * 24 * total_gb / 100 if total_gb else None,
         "pred": {24: clip_pct(line.at(24)), 168: clip_pct(line.at(168))},
-        "hours_to_threshold": hours_to(level_now, speed_h, thr, c["max_hours_to_threshold"]),
+        "hours_to_threshold": 0.0 if above else hours_to(level_now, speed_h, thr,
+                                                         c["max_hours_to_threshold"]),
     })
     return result
 
 
-def fast_growth(used: pd.Series, now: pd.Timestamp, cfg: dict) -> dict:
-    """Питання 2: швидкість за останні window_min хвилин проти звичайної в ці ж хвилини доби."""
+def growth_start(used: pd.Series, now: pd.Timestamp, limit: float, cfg: dict) -> pd.Timestamp:
+    """Звідки почався незвичний ріст: ідемо назад від now, поки швидкість за 30 хв
+    (на 10-хв відрізках) вища за межу limit."""
+    x = used[used.index <= now].resample(f"{cfg['steps']['bin_min']}min").last().dropna()
+    rate = (x - x.shift(3)) / 0.5            # %/год за останні 30 хв
+    i = len(x) - 1
+    while i >= 3 and rate.iloc[i] > limit:
+        i -= 1
+    return x.index[i] - pd.Timedelta(minutes=30) if i < len(x) - 1 else now - pd.Timedelta(minutes=30)
+
+
+def fast_growth(used: pd.Series, now: pd.Timestamp, steps: list[dict], cfg: dict) -> dict:
+    """Питання 2: швидкість за останні window_min хвилин проти звичайної в ці ж хвилини доби.
+    Якщо у вікні була завершена сходинка (бекап, видалення) — пряма лише по точках після неї."""
     c, thr = cfg["fast_growth"], cfg["threshold_pct"]
     w = pd.Timedelta(minutes=c["window_min"])
+    bin_ = pd.Timedelta(minutes=cfg["steps"]["bin_min"])
 
-    def slope(t_end):
-        seg = used[(used.index > t_end - w) & (used.index <= t_end)]
-        if len(seg) < c["window_min"] / 2:
+    def slope(t_end, t_from=None, min_points=c["window_min"] / 2):
+        lo = t_end - w if t_from is None else max(t_end - w, t_from)
+        seg = used[(used.index > lo) & (used.index <= t_end)]
+        if len(seg) < min_points:
             return None
         t = np.array([hours_between(t_end, ts) for ts in seg.index])
         return Line(t, seg.to_numpy())
 
-    line = slope(now)
+    recent = [s["end"] + bin_ for s in steps if s["end"] + bin_ > now - w]
+    after_step = max(recent) if recent else None
+    if after_step is not None:
+        line = slope(now, after_step, c["min_points_after_step"])
+        if line is None:
+            # одразу після сходинки точок ще мало: вважаємо, що рівень не змінюється
+            v = float(used.iloc[-1])
+            line = Line(np.array([-0.1, 0.0]), np.array([v, v]))
+    else:
+        line = slope(now)
     if line is None:
         return {"status": "мало даних"}
     usual = [ln.b for k in range(1, c["baseline_days"] + 1)
              if (ln := slope(now - pd.Timedelta(days=k))) is not None]
     usual_p90 = float(np.percentile(usual, 90)) if usual else None
     limit = max(c["min_pct_per_h"], c["factor"] * max(usual_p90 or 0.0, 0.0))
-    level_now = line.at(0)[0]
+    level_now = min(line.at(0)[0], float(used.iloc[-1]))
+    # Незвичний — лише ріст, розподілений у часі. Якщо за останні 30 хв більшу
+    # частину приросту дала одна хвилина — це стрибок (з'явився файл, бекап),
+    # а не ріст; його оцінюють тренд і питання 3
+    last30 = used[used.index > now - pd.Timedelta(minutes=30)]
+    rise = float(last30.iloc[-1] - last30.iloc[0]) if len(last30) > 1 else 0.0
+    biggest = float(last30.diff().max()) if len(last30) > 1 else 0.0
+    one_jump = rise > 0 and biggest > c["max_single_minute_share"] * rise
+    unusual = bool(line.b > limit and not one_jump)
+    above = float(used.iloc[-1]) >= thr
     return {
         "status": "ok",
+        "line": line,
         "level_now": level_now,
         "speed_pct_h": line.b,
         "usual_pct_h": usual_p90,
         "usual_days": len(usual),
         "limit_pct_h": limit,
-        "unusual": bool(line.b > limit),
+        "unusual": unusual,
+        "after_step_from": after_step,
+        "growth_from": growth_start(used, now, limit, cfg) if unusual else None,
+        "above_threshold_now": above,
         "pred": {1: clip_pct(line.at(1))},
-        "hours_to_threshold": hours_to(level_now, line.b, thr, 24 * 365),
+        "hours_to_threshold": 0.0 if above else hours_to(level_now, line.b, thr, 24 * 365),
     }
+
+
+def completed_rises(used: pd.Series, cfg: dict) -> list[dict]:
+    """Завершені різкі підйоми будь-якої тривалості (≥ step_rate_pp за 10 хв, разом
+    ≥ step_min_pp), після яких рівень уже не росте: бекап, вивантаження, швидке
+    заповнення, що скінчилося. Підйом, що триває досі, сюди не входить."""
+    c = cfg["steps"]
+    x = used.resample(f"{c['bin_min']}min").last().dropna()
+    d = x.diff().to_numpy()
+    up = d >= c["step_rate_pp"]
+    rises, i = [], 1
+    while i < len(x):
+        if not up[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(x) and up[j + 1]:
+            j += 1
+        size = float(x.iloc[j] - x.iloc[i - 1])
+        if j < len(x) - 1 and size >= c["step_min_pp"]:
+            rises.append({"start": x.index[i - 1], "end": x.index[j], "size_pp": size})
+        i = j + 1
+    return rises
 
 
 def speed_without_jumps(used: pd.Series, start: pd.Timestamp, now: pd.Timestamp,
                         steps: list[dict], regular: dict, cfg: dict) -> float:
-    """Швидкість росту (%/год) без регулярних стрибків: з ряду віднімаємо кожен
-    регулярний стрибок (і додаємо назад його видалення). Інакше на «сходах»
-    тренд уже містить бекапи, і наступний бекап порахувався б двічі."""
+    """Повільна швидкість росту (%/год) — без різких підйомів: з ряду віднімаємо кожен
+    завершений різкий підйом (бекап, вивантаження...) і додаємо назад видалення
+    регулярних стрибків. Інакше на «сходах» наступний бекап порахувався б двічі,
+    а вивантаження, що вже скінчилося, — «росло б» і далі."""
     data = used[(used.index > start) & (used.index <= now)].copy()
+    for r in completed_rises(data, cfg):
+        data[data.index > r["end"]] -= r["size_pp"]
     for s in steps:
         if s["size_pp"] > 0 and s["start"] >= start and matches_regular(s, regular, cfg):
-            data[data.index > s["end"]] -= s["size_pp"]
             removal = removal_after(s, steps, cfg)
             if removal:
                 data[data.index > removal["end"]] -= removal["size_pp"]   # size_pp < 0 -> додаємо
@@ -347,9 +425,10 @@ class LinearMethod:
     def predict(self, used: pd.Series, free: pd.Series, now: pd.Timestamp, cfg: dict) -> dict:
         steps = find_steps(used, free, cfg)
         regular = find_regular_rise(steps, now, cfg)
-        tr = trend(used, free, now, steps, regular, cfg)
+        fg = fast_growth(used, now, steps, cfg)
+        tr = trend(used, free, now, steps, regular, cfg, fg)
         return {"now_pct": float(used.iloc[-1]), "now_free_gb": float(free.iloc[-1]),
-                "trend": tr, "fast_growth": fast_growth(used, now, cfg),
+                "trend": tr, "fast_growth": fg,
                 "jump": next_jump(used, free, now, steps, regular, tr, cfg)}
 
 
@@ -413,7 +492,8 @@ def to_rows(result: dict, method: str) -> list[dict]:
     tr = result["trend"]
     tr_details = {"status": tr.get("status"), "start": fmt_ts(tr.get("start")),
                   "speed_pct_day": tr.get("speed_pct_day"), "speed_gb_day": tr.get("speed_gb_day"),
-                  "points_h": tr.get("points")}
+                  "points_h": tr.get("points"), "above_threshold_now": tr.get("above_threshold_now"),
+                  "excluded_growth_from": fmt_ts(tr.get("excluded_growth_from"))}
     if tr.get("excluded"):
         tr_details["excluded_jump"] = {"from": fmt_ts(tr["excluded"]["from"]),
                                        "size_gb": tr["excluded"]["size_gb"],
@@ -431,7 +511,10 @@ def to_rows(result: dict, method: str) -> list[dict]:
                  "hours_to_threshold": fg.get("hours_to_threshold"),
                  "details": {"status": fg.get("status"), "speed_pct_h": fg.get("speed_pct_h"),
                              "usual_pct_h": fg.get("usual_pct_h"), "limit_pct_h": fg.get("limit_pct_h"),
-                             "unusual": fg.get("unusual")}})
+                             "unusual": fg.get("unusual"),
+                             "after_step_from": fmt_ts(fg.get("after_step_from")),
+                             "growth_from": fmt_ts(fg.get("growth_from")),
+                             "above_threshold_now": fg.get("above_threshold_now")}})
 
     j = result["jump"]
     rows.append({"model": method, "kind": "jump", "horizon_h": j.get("hours_until"),
@@ -524,6 +607,11 @@ def hours_text(h) -> str:
     return f"{h:.0f} год" if h < 72 else f"{h / 24:.1f} дн"
 
 
+def until_text(h, thr) -> str:
+    """«до 90 %: 42 год» або «вже вище 90 %»."""
+    return f"вже вище {thr} %" if h == 0 else f"до {thr} %: {hours_text(h)}"
+
+
 def print_result(server: str, now: pd.Timestamp, results: dict, cfg: dict) -> None:
     thr = cfg["threshold_pct"]
     print(f"\n{server}, момент {now:%Y-%m-%d %H:%M} UTC")
@@ -534,20 +622,22 @@ def print_result(server: str, now: pd.Timestamp, results: dict, cfg: dict) -> No
             p24, p168 = tr["pred"][24], tr["pred"][168]
             print(f"    1. Тренд з {tr['start']:%d.%m %H:%M}: {tr['speed_pct_day']:+.2f} %/добу"
                   f" ({f1(tr['speed_gb_day'], ' ГБ/добу')}); +24 год {p24[0]:.1f} % ({p24[1]:.1f}–{p24[2]:.1f}),"
-                  f" +7 дн {p168[0]:.1f} % ({p168[1]:.1f}–{p168[2]:.1f}); до {thr} %: "
-                  f"{hours_text(tr['hours_to_threshold'])}")
+                  f" +7 дн {p168[0]:.1f} % ({p168[1]:.1f}–{p168[2]:.1f}); "
+                  f"{until_text(tr['hours_to_threshold'], thr)}")
         else:
             print(f"    1. Тренд: {tr.get('status')} (з {tr['start']:%d.%m %H:%M}, {tr['points']} год)")
         if tr.get("excluded"):
             e = tr["excluded"]
             print(f"       без тимчасового стрибка з {e['from']:%d.%m %H:%M} (+{e['size_gb']:.0f} ГБ),"
                   f" видалення очікується до {e['expected_removal_by']:%d.%m %H:%M}")
+        if tr.get("excluded_growth_from") is not None:
+            print(f"       без незвичного росту з {tr['excluded_growth_from']:%d.%m %H:%M} (його описує п. 2)")
         if fg.get("status") == "ok":
             usual = "—" if fg["usual_pct_h"] is None else f"{fg['usual_pct_h']:.2f}"
             print(f"    2. Ріст за {cfg['fast_growth']['window_min']} хв: {fg['speed_pct_h']:+.2f} %/год "
                   f"(зазвичай до {usual}, межа {fg['limit_pct_h']:.2f}) -> "
                   f"{'НЕЗВИЧНИЙ' if fg['unusual'] else 'звичайний'}; +1 год {fg['pred'][1][0]:.1f} %; "
-                  f"до {thr} %: {hours_text(fg['hours_to_threshold'])}")
+                  f"{until_text(fg['hours_to_threshold'], thr)}")
         else:
             print(f"    2. Ріст: {fg.get('status')}")
         if j["found"]:

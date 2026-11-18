@@ -152,6 +152,38 @@ def test_staircase_jump_not_counted_twice():
     assert j["above_threshold_after"] is False     # 76 + 9 = 85 % < 90 %
 
 
+def test_after_step_one_hour_is_flat():
+    """Одразу після щоденного стрибка +1 год — на рівні після сходинки, а не «росте далі»."""
+    m = minutes(14)
+    level = daily_backup(np.full(len(m), 50.0), 9, 120, 180)
+    used, free = disk(level)
+    now = T0 + pd.Timedelta(days=13, hours=2, minutes=40)     # через 40 хв після стрибка
+    fg = predict(used, free, now)["fast_growth"]
+    assert fg["after_step_from"] is not None
+    assert abs(fg["pred"][1][0] - 59) < 0.5
+    assert abs(fg["speed_pct_h"]) < 0.5
+
+
+def test_unusual_growth_not_in_trend_and_already_above():
+    """Швидке заповнення 40 -> 93 %: тренд без відрізка незвичного росту (лишається
+    пласким), а коли диск уже вище 90 % — години до порогу = 0 («вже вище»)."""
+    m = minutes(13)
+    level = np.full(len(m) + 240, 40.0)
+    level[-240:] = np.minimum(40 + 15 * np.arange(1, 241) / 60, 93)   # 15 %/год до 93 %
+    level[-20:] = 93 + 0.5 * np.arange(1, 21) / 20                    # ще трохи росте
+    used, free = disk(level)
+    r = predict(used, free)
+    assert r["trend"]["above_threshold_now"] is True
+    assert r["trend"]["hours_to_threshold"] == 0.0
+    assert fc.until_text(r["trend"]["hours_to_threshold"], 90) == "вже вище 90 %"
+
+    mid = used.index[-240 + 90]                                       # у розпалі росту (~62 %)
+    r_mid = predict(used, free, mid)
+    assert r_mid["fast_growth"]["unusual"] is True
+    assert r_mid["trend"]["excluded_growth_from"] is not None
+    assert abs(r_mid["trend"]["speed_pct_day"]) < 1                   # тренд не «підхопив» ріст
+
+
 def test_predictions_written(tmp_path):
     """Запис у predictions: по 4 рядки на диск (trend ×2, fast_growth, jump), model = linear."""
     db = tmp_path / "test.db"

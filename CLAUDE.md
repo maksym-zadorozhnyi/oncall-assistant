@@ -133,7 +133,8 @@
 
 ```
 agent/        agent.py, config.yaml
-simulator/    simulator.py, scenarios.py, profiles.yaml (профілі sim-серверів)
+simulator/    simulator.py, scenarios.py, profiles.yaml (профілі sim-серверів),
+              disk_runs.py (короткі прогони диска для стенду прогнозу)
 api/          app.py (FastAPI)
 core/         config.py (читання .env), db.py, etl.py, forecast.py + forecast.yaml (прогноз диска),
               forecast_bench.py (стенд перевірки прогнозу), analyzer.py, ml.py, rules.py, kb.py, llm.py,
