@@ -8,7 +8,10 @@
 - не читає sim_incidents (ключ відповідей симулятора);
 - помилку повертає словником {"error": "..."}, а не падає.
 
-Docstring кожної функції — майбутній опис інструменту для LLM.
+Docstring кожної функції — опис інструменту для LLM (core/tool_specs.py бере його як є).
+Тому в ньому: що повертає, коли викликати (з прикладами розмовних питань) і чого
+функція не вміє. Параметри для LLM описано в core/tool_specs.py. Усе, що після рядка
+«Лише для коду:», LLM не бачить (параметри, які ставить код: now, max_points, with_line).
 
 Перевірка з консолі:
     python -m core.tools get_status --server sim-2 --now "2026-11-10 08:00"
@@ -386,20 +389,25 @@ def server_status(conn, s, now) -> dict:
 
 @tool
 def get_status(server: str | None = None, now: str | None = None) -> dict:
-    """Поточний стан одного сервера або всіх.
+    """Стан одного сервера або всіх на момент «зараз»: метрики, диски, служби і пули IIS, перевірки.
 
-    Коли викликати: «Що з серверами?», «Що з sim-1?», «Чи працює ApiPool?»,
-    «Коли закінчується сертифікат?», «Коли був останній бекап?».
-    Параметри: server — назва (None — усі сервери); now — момент «зараз»,
-    місцевий час «2026-11-10 08:00» (None — поточний час).
+    Коли викликати: загальне питання «як справи» — «Що з серверами?», «Що з sim-1?»,
+    «чо там з бд-шкою?», «здається, сайт лежить», «Чи працює ApiPool?», «Коли
+    закінчується сертифікат?», «Коли був останній бекап?», «місця на дисках ще багато?».
+    Без server — усі сервери одразу (зручно, коли незрозуміло, про який ідеться).
+    Не вміє: історію за період (get_metric_history), події і причини (get_timeline),
+    прогноз диска (get_disk_forecast), процеси (get_top_processes).
     Повертає: data_until (час останніх даних), data_age_h (скільки годин тому),
     stale (true — даних немає довше 10 хв: тоді всі значення — останні відомі, а не
     поточні, див. stale_note), metrics (CPU, RAM, I/O, мережа, сайт), disks (used_pct,
     free_gb, total_gb), services (стан і відколи), not_running, checks (http:
-    response_ms; cert: days_left; backup: age_h на час перевірки і age_h_now на now;
+    response_ms; cert: days_left; backup: age_h на час перевірки і age_h_now на «зараз»;
     sql_port: response_ms; ok і час перевірки), sites (сайт -> пул IIS),
     notes (ситуаційні примітки), about (постійні факти про сервер).
     Так само в усіх інструментах: data_until, data_age_h, stale, stale_note.
+
+    Лише для коду: server — назва (None — усі сервери); now — момент «зараз», місцевий
+    час «2026-11-10 08:00» (None — поточний час); now ставить код із сесії, не LLM.
     """
     with connect() as conn:
         if server:
@@ -448,18 +456,24 @@ def pick_points(df: pd.DataFrame, mask: pd.Series, limit: int, median: float) ->
 @tool
 def get_metric_history(server: str, metric: str, start: str | None = None, end: str | None = None,
                        now: str | None = None, max_points: int = 50) -> dict:
-    """Історія однієї метрики за період (очищені дані після ETL).
+    """Історія однієї метрики сервера за період (очищені дані після ETL).
 
-    Коли викликати: «Що було вчора о 14:00 на sim-2?», «Який був максимум CPU за ніч?»,
-    «Як змінювався диск E: за тиждень?».
-    Параметри: metric — cpu_pct, ram_pct, disk_read_mbs, disk_write_mbs, net_in_mbs,
-    net_out_mbs, app_response_ms, app_error_pct, disk_used_pct:<диск>, disk_free_gb:<диск>
-    (наприклад disk_used_pct:E:); start, end — місцевий час (за замовчуванням 24 год до now);
-    now — момент «зараз» (None — поточний час); max_points — скільки точок у series.
+    Коли викликати: значення в минулий час або за період — «Що було вчора о 14:00 на
+    sim-2?», «Який був максимум CPU за ніч?», «Як змінювався E: за тиждень?», «коли
+    почало гальмувати?», «скільки тримався пік?».
+    Не вміє: процеси (get_top_processes), події (get_timeline), прогноз (get_disk_forecast).
+    Температури, вентиляторів, мережевих з'єднань і входів користувачів (RDP) немає —
+    система таких даних не збирає.
     Повертає: first, last, change, mean, min і max (з часом), points (скільки хвилин є),
     imputed (заповнено інтерполяцією), outliers (позначено викидами) і outlier_points,
     gaps (пропуски даних від–до), series — проріджений ряд [місцевий час, значення]
-    (середнє по відрізках step_min хвилин).
+    (середнє по відрізках step_min хвилин). Немає даних за період — error з
+    nearest_data_local (найближчі дані перед періодом).
+
+    Лише для коду: metric — cpu_pct, ram_pct, disk_read_mbs, disk_write_mbs, net_in_mbs,
+    net_out_mbs, app_response_ms, app_error_pct, disk_used_pct:<диск>, disk_free_gb:<диск>;
+    start, end — місцевий час (за замовчуванням 24 год до now); now — момент «зараз»
+    (None — поточний час); max_points — скільки точок у series (для LLM код ставить 50).
     """
     max_points = as_number(max_points, "max_points", 2)
     with connect() as conn:
@@ -524,16 +538,19 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
 
 @tool
 def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top: int = 5) -> dict:
-    """Процеси з найбільшим навантаженням у знімку, найближчому до моменту now.
+    """Процеси з найбільшим навантаженням на момент «зараз» (останній знімок до нього).
 
-    Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «Що вантажило о 14:07?».
-    Параметри: now — момент, місцевий час (None — поточний час); by — "cpu" або "ram";
-    top — скільки процесів. Знімок береться не пізніше now і не давніший за 10 хв;
-    інакше — помилка «немає знімка».
+    Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «чого sim-1 тупить?»,
+    «який пул жере проц?», «Чому гальмує сервер?» (разом зі станом).
+    Не вміє: процеси в минулий момент — лише останній знімок до «зараз» (не давніший
+    за 10 хв; інакше — помилка «немає знімка»); історію CPU (get_metric_history).
     Повертає: snapshot_local (час знімка), cpu_server і ram_server_pct (CPU і RAM сервера
     в ту хвилину — щоб порівняти з процесом), processes: name, pid, cpu_pct (0–100 % від
     усього CPU), ram_mb, app_pool (для w3wp.exe), service (служба, якщо цей exe належить
     лише одній службі за інвентарем).
+
+    Лише для коду: now — момент, місцевий час (None — поточний час); by — "cpu" або "ram";
+    top — скільки процесів.
     """
     if by not in ("cpu", "ram"):
         raise ToolError(f"by має бути cpu або ram, а не «{by}»")
@@ -591,15 +608,20 @@ def free_at(conn, server_id: int, drive: str, t: pd.Timestamp):
 @tool
 def get_folder_growth(server: str, period_h: float = 24, drive: str | None = None,
                       now: str | None = None) -> dict:
-    """Як змінився розмір відстежуваних тек за період і що росте на дисках.
+    """Що росте на дисках: як змінився розмір відстежуваних тек за період до «зараз».
 
-    Коли викликати: «Що там росте?», «Яка тека виросла за добу?», «Чим зайнятий диск D:?».
-    Параметри: period_h — період у годинах до now (за замовчуванням 24); drive — лише
-    один диск, наприклад "E:"; now — момент «зараз» (None — поточний час).
+    Коли викликати: «Що там росте?», «чого E: пухне?», «Яка тека виросла за добу?»,
+    «куди поділось місце?», «Чим зайнятий диск D:?», «чому диск стрибнув?» (разом з
+    get_timeline).
+    Не вміє: окремі файли (агент знає лише розмір відстежуваних тек); прогноз
+    (get_disk_forecast); що буде після прибирання.
     Повертає: folders — по кожній теці size_start_gb, size_now_gb, growth_gb,
     growth_gb_per_day (від найбільшого росту); disks — по кожному диску growth_gb (ріст
     зайнятого місця зі зміни вільного), folders_gb (сума тек) і other_gb (росте щось
     поза відстежуваними теками).
+
+    Лише для коду: period_h — період у годинах до now (за замовчуванням 24); drive — лише
+    один диск, наприклад "E:"; now — момент «зараз» (None — поточний час).
     """
     period_h = as_number(period_h, "period_h", 0, integer=False, strict=True)
     with connect() as conn:
@@ -730,11 +752,12 @@ def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bo
 @tool
 def get_disk_forecast(server: str, drive: str | None = None, now: str | None = None,
                       with_line: bool = False) -> dict:
-    """Прогноз заповнення диска (лінійний метод, три питання).
+    """Прогноз заповнення диска на момент «зараз» (лінійний метод, три питання).
 
-    Коли викликати: «Коли заповниться E:?», «Чи поміститься бекап?», «На скільки вистачить диска?».
-    Параметри: drive — диск, наприклад "E:" (None — усі диски); now — момент «зараз»
-    (None — поточний час); with_line — додати точки прямої тренду для графіка.
+    Коли викликати: «Коли заповниться E:?», «на скільки ще вистачить місця?», «диск скоро
+    кінчиться?», «Чи поміститься бекап сьогодні вночі?», «росте незвично швидко?».
+    Без drive — усі диски сервера.
+    Не вміє: причину росту (get_folder_growth, get_timeline); що буде після прибирання.
     Повертає по кожному диску:
     - trend — повільний ріст від останнього прибирання (from_local, from_reason; points —
       скільки погодинних точок у прямій; якщо їх менше за min_points — status «мало даних»,
@@ -749,6 +772,9 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
     threshold_pct — поріг (90 %); to_threshold_pp і to_threshold_gb — скільки лишилось до порогу.
     Якщо даних свіжих немає (stale) — прогнозу на «зараз» немає (disks відсутнє), а
     forecast_at_last_data — прогноз на момент останніх даних, НЕ на зараз.
+
+    Лише для коду: drive — диск, наприклад "E:" (None — усі диски); now — момент «зараз»
+    (None — поточний час); with_line — додати точки прямої тренду для графіка (дашборд).
     """
     cfg = forecast.load_config()
     with connect() as conn:
@@ -799,20 +825,51 @@ def state_changes(rows, key: str, value: str) -> list:
     return out
 
 
+TIMELINE_TYPES = ("event", "service", "check", "alert")
+
+
+def timeline_types(types) -> set[str]:
+    """Фільтр типів: None / порожньо — усі; список або рядок через кому."""
+    if types is None or types == "" or types == []:
+        return set(TIMELINE_TYPES)
+    if isinstance(types, str):
+        types = [t.strip() for t in types.split(",") if t.strip()]
+    bad = [t for t in types if t not in TIMELINE_TYPES]
+    if bad:
+        raise ToolError(f"невідомий тип «{bad[0]}»; можливі: {', '.join(TIMELINE_TYPES)}")
+    return set(types)
+
+
 @tool
 def get_timeline(server: str, start: str | None = None, end: str | None = None,
-                 now: str | None = None, limit: int = 50) -> dict:
-    """Хронологія подій сервера за період: журнал Windows, зміни стану служб і перевірок, алерти.
+                 now: str | None = None, limit: int = 50, types=None, source: str | None = None) -> dict:
+    """Хронологія сервера за період: журнал Windows, зміни стану служб, пулів і перевірок, алерти.
 
-    Коли викликати: «Що сталося на sim-1 за ніч?», «Чому впав сайт?», «Що було перед падінням пулу?».
-    Параметри: start, end — місцевий час (за замовчуванням 24 год до now); now — момент
-    «зараз» (None — поточний час); limit — скільки записів (якщо більше — останні).
+    Коли викликати: «Що сталося на sim-1 за ніч?», «Чому впав сайт?», «Що було перед
+    падінням пулу?», «чого бекап не зробився?», «Коли за місяць падав SitePool і скільки
+    лежав?» (types=["service"], source="SitePool", start на місяць назад).
+    Не вміє: значення метрик (get_metric_history); причину, якої немає в подіях.
     Повертає items у хронологічному порядку: ts_local, type (event — подія журналу рівня
     Warning і вище, а також 7036 і 18264; service — зміна стану служби чи пулу; check —
     зміна результату перевірки; alert — алерт), source, code, level, text.
-    noise — часті шумові події (1014, 37) лише кількістю; counts — кількість за типами.
+    noise — часті шумові події (1014, 37) лише кількістю; counts — кількість за типами
+    (після фільтрів); filters — які фільтри застосовано.
+
+    Лише для коду: start, end — місцевий час (за замовчуванням 24 год до now); now — момент
+    «зараз» (None — поточний час); limit — скільки записів (якщо більше — останні);
+    types — лише ці типи (список або рядок через кому); source — частковий збіг без
+    урахування регістру з джерелом або текстом запису (назва служби, пулу, перевірки).
     """
     limit = as_number(limit, "limit", 1)
+    want = timeline_types(types)
+    needle = source.strip().lower() if isinstance(source, str) and source.strip() else None
+
+    def keep(kind: str, src, text) -> bool:
+        """Чи лишити запис за фільтрами types / source."""
+        if kind not in want:
+            return False
+        return needle is None or needle in (src or "").lower() or needle in (text or "").lower()
+
     with connect() as conn:
         s = find_server(conn, server)
         t_now, _ = resolve_now(conn, s, now)
@@ -833,6 +890,8 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
         items, noise = [], {}
         for r in conn.execute("SELECT ts, log, source, event_id, level, message FROM events "
                               "WHERE server_id = ? AND ts > ? AND ts < ? ORDER BY ts", (s["id"], lo, hi)):
+            if not keep("event", r["source"], r["message"]):
+                continue
             if r["event_id"] in NOISE_EVENTS:
                 noise[str(r["event_id"])] = noise.get(str(r["event_id"]), 0) + 1
                 continue
@@ -862,16 +921,22 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
                               (s["id"], lo, hi)):
             items.append({"ts": r["opened_at"], "type": "alert", "source": r["rule_id"], "code": r["severity"],
                           "level": r["severity"], "text": (r["message"] or "")[:TEXT_MAX]})
+    # фільтри types / source — для змін стану, перевірок і алертів (події відфільтровано вище)
+    items = [x for x in items if x["type"] == "event" or keep(x["type"], x["source"], x["text"])]
     items.sort(key=lambda x: x["ts"])
-    counts = {k: sum(1 for x in items if x["type"] == k) for k in ("event", "service", "check", "alert")}
+    counts = {k: sum(1 for x in items if x["type"] == k) for k in TIMELINE_TYPES}
     total = len(items)
     items = items[-limit:]
     # час у відповіді — місцевий, першим полем
     items = [{"ts_local": loc(x["ts"]), **{k: v for k, v in x.items() if k != "ts"}} for x in items]
     if total > len(items):
         notes.append(f"показано останні {len(items)} з {total} записів")
-    return {"server": server, "from_local": loc(start_t), "to_local": loc(end_t),
-            "items": items, "noise": noise, "counts": counts, **fresh, "notes": notes}
+    out = {"server": server, "from_local": loc(start_t), "to_local": loc(end_t),
+           "items": items, "noise": noise, "counts": counts, **fresh, "notes": notes}
+    if want != set(TIMELINE_TYPES) or needle:
+        out["filters"] = {"types": [t for t in TIMELINE_TYPES if t in want], "source": source}
+        notes.append("показано лише записи за фільтрами (filters); інших типів і джерел тут немає")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +958,8 @@ def main() -> None:
     parser.add_argument("--max-points", dest="max_points", type=int)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--with-line", dest="with_line", action="store_true", default=None)
+    parser.add_argument("--types", help="get_timeline: типи через кому (event,service,check,alert)")
+    parser.add_argument("--source", help="get_timeline: частковий збіг з джерелом або текстом")
     args = vars(parser.parse_args())
     func = TOOLS[args.pop("function")]
     kwargs = {k: v for k, v in args.items() if v is not None}

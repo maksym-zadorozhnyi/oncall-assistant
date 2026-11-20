@@ -31,6 +31,9 @@ docs/experiments/forecast/backtest.csv
 # Векторна база ChromaDB (перебудовується з knowledge/runbooks)
 data/chroma/
 
+# Журнал асистента (питання, відповіді, Telegram ID) — лише локально
+data/logs/
+
 # Службові файли
 .ipynb_checkpoints/
 .vscode/

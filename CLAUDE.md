@@ -159,13 +159,14 @@ simulator/    simulator.py, scenarios.py, profiles.yaml (профілі sim-се
 api/          app.py (FastAPI)
 core/         config.py (читання .env), db.py, etl.py, forecast.py + forecast.yaml (прогноз диска),
               forecast_bench.py (стенд перевірки прогнозу), tools.py (функції-інструменти),
-              analyzer.py, ml.py, rules.py, kb.py, llm.py,
-              stt.py, tts.py, vision.py, emotion.py, assistant.py, charts.py,
-              reports.py
+              llm.py (виклик LLM), tool_specs.py (опис інструментів для LLM),
+              assistant.py + assistant.yaml (ядро ask() і консоль), prompts/system.md,
+              analyzer.py, ml.py, rules.py, kb.py,
+              stt.py, tts.py, vision.py, emotion.py, charts.py, reports.py
 bot/          bot.py
 web/          app.py, pages/ (сторінки Streamlit)
 knowledge/    runbooks/*.md, rules.yaml, ontology.yaml
-data/         oncall.db, datasets/
+data/         oncall.db, datasets/, logs/assistant.jsonl (журнал асистента, не комітимо)
 notebooks/    експерименти і метрики для записки
 tests/        exam.yaml (іспит бота), rag_questions.yaml, тести
 docs/         tz.pdf (лише локально), milestones.md, progress.md, decisions.md, er.md,
@@ -325,6 +326,7 @@ awesome-prometheus-alerts.
 python -m simulator.simulator                # симулятор
 python -m uvicorn api.app:app --port 8000    # REST API
 python -m agent.agent                        # агент (від імені адміністратора)
+python -m core.assistant --now "2026-11-10 08:00"   # асистент у консолі (момент в історії)
 python -m core.analyzer                      # аналізатор
 python -m bot.bot                            # Telegram-бот
 streamlit run web/app.py                     # веб-додаток

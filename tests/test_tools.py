@@ -270,6 +270,32 @@ def test_timeline_change_at_window_start(db):
     assert any(x["type"] == "service" and x["ts_local"] == local(D + 50) for x in r["items"])
 
 
+def test_timeline_filter_types(db):
+    """types: лише вибрані типи; counts — після фільтра; список і рядок через кому — однаково."""
+    args = dict(start=local(D), end=local(D + 120), now=local(D + 120))
+    r = tools.get_timeline("t-1", types=["service"], **args)
+    assert [x["type"] for x in r["items"]] == ["service", "service"]
+    assert r["counts"] == {"event": 0, "service": 2, "check": 0, "alert": 0}
+    assert r["noise"] == {}                                   # події не вибрано — шуму теж немає
+    assert r["filters"] == {"types": ["service"], "source": None}
+    r2 = tools.get_timeline("t-1", types="event,check", **args)
+    assert {x["type"] for x in r2["items"]} == {"event", "check"} and r2["noise"] == {"1014": 3}
+    assert "невідомий тип" in tools.get_timeline("t-1", types=["servis"], **args)["error"]
+    assert "filters" not in tools.get_timeline("t-1", **args)  # без фільтрів — як раніше
+
+
+def test_timeline_filter_source(db):
+    """source: частковий збіг без регістру з джерелом або текстом (WAS 5009 згадує SitePool)."""
+    r = tools.get_timeline("t-1", start=local(D), end=local(D + 120), now=local(D + 120), source="sitepool")
+    got = [(x["type"], x["source"]) for x in r["items"]]
+    assert got == [("event", "WAS"), ("service", "SitePool"), ("service", "SitePool")]
+    assert r["noise"] == {}                                   # DNS 1014 не про SitePool
+    r = tools.get_timeline("t-1", start=local(D), end=local(D + 120), now=local(D + 120),
+                           types=["service"], source="SitePool")
+    assert [x["text"] for x in r["items"]] == ["SitePool (apppool): running -> stopped",
+                                               "SitePool (apppool): stopped -> running"]
+
+
 def test_disk_forecast_same_as_forecast_module(db):
     """Обгортка дає ті самі числа, що й core/forecast.py (одне джерело чисел)."""
     r = tools.get_disk_forecast("t-1", drive="C:", now=local(MINUTES - 1), with_line=True)

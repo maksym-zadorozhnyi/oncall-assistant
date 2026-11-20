@@ -14,3 +14,7 @@ pytest==9.2.0          # автоматичні тести: python -m pytest
 # --- Етап 0: функції-інструменти і дашборд ---
 streamlit==1.67.0      # дашборд: streamlit run web/app.py
 plotly==7.1.0          # інтерактивні графіки дашборду (наведення, масштаб)
+
+# --- Етап 1: ядро асистента і бот ---
+anthropic==2.12.0      # Claude API (tool use); 2.x надсилає версію API 2026-10-21: temperature не передаємо
+aiogram==3.33.0        # Telegram-бот: асинхронний, long polling
