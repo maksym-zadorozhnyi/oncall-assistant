@@ -677,9 +677,16 @@ def trend_line(tr: dict, now: pd.Timestamp) -> list:
     return out
 
 
-def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bool) -> dict:
+def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bool,
+                history_start: pd.Timestamp) -> dict:
     tr, fg, j = r["trend"], r["fast_growth"], r["jump"]
-    trend_out = {"status": tr.get("status"), "from_local": loc(tr.get("start")),
+    # звідки пряма: від останнього різкого падіння (прибирання) або, якщо падінь
+    # не було, від початку історії, яку бере прогноз (history_days)
+    from_reason = ("початок історії (різких падінь не було)" if tr.get("start") == history_start
+                   else "останнє різке падіння")
+    trend_out = {"status": tr.get("status"), "from_local": loc(tr.get("start")), "from_reason": from_reason,
+                 "points": tr.get("points"),       # скільки погодинних точок у прямій
+                 "min_points": cfg["trend"]["min_hours"],   # менше — «мало даних», прямої немає
                  "hours_to_threshold": num(tr.get("hours_to_threshold"), 1)}
     if tr.get("status") == "ok":
         trend_out.update({"pct_per_day": num(tr["speed_pct_day"]), "gb_per_day": num(tr["speed_gb_day"], 1),
@@ -729,7 +736,9 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
     Параметри: drive — диск, наприклад "E:" (None — усі диски); now — момент «зараз»
     (None — поточний час); with_line — додати точки прямої тренду для графіка.
     Повертає по кожному диску:
-    - trend — повільний ріст від останнього прибирання: pct_per_day, gb_per_day,
+    - trend — повільний ріст від останнього прибирання (from_local, from_reason; points —
+      скільки погодинних точок у прямій; якщо їх менше за min_points — status «мало даних»,
+      прямої немає): pct_per_day, gb_per_day,
       рівень in_24h і in_7d з інтервалом 10–90 % (low–high), hours_to_threshold
       (годин до порогу; 0 — вже вище; null — не досягне);
     - fast_growth — ріст за останні 90 хв: pct_per_h, звичайний максимум у ці хвилини
@@ -761,9 +770,9 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
             if len(used) < 2 or free.empty:
                 out.append({"drive": d, "error": "замало даних для прогнозу"})
                 continue
-            out.append(disk_answer(d, method.predict(used, free, at, cfg), at, cfg, with_line))
+            out.append(disk_answer(d, method.predict(used, free, at, cfg), at, cfg, with_line, used.index[0]))
     result = {"server": server, "now": pair(t), "method": cfg["method"],
-              "threshold_pct": cfg["threshold_pct"], **fresh}
+              "threshold_pct": cfg["threshold_pct"], "history_days": cfg["history_days"], **fresh}
     if fresh["stale"]:
         result["message"] = (f"немає свіжих даних; останні — {fresh['data_until']['ts_local']} "
                              f"({age_text(fresh['data_age_h'])} тому). Прогнозу на «зараз» немає")

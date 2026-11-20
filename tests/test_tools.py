@@ -284,6 +284,18 @@ def test_disk_forecast_same_as_forecast_module(db):
     assert d["trend"]["hours_to_threshold"] == round(direct["trend"]["hours_to_threshold"], 1)
     assert d["fast_growth"]["unusual"] is False and d["jump"]["found"] is False
     assert len(d["trend_line"]) > 10
+    # звідки прогноз: погодинні точки — ті самі, що в forecast.trend; падінь не було — від початку історії
+    assert d["trend"]["points"] == direct["trend"]["points"] and d["trend"]["points"] >= 47
+    assert d["trend"]["from_reason"].startswith("початок історії")
+    assert r["history_days"] == cfg["history_days"] == 14
+    assert d["trend"]["min_points"] == cfg["trend"]["min_hours"]
+
+
+def test_disk_forecast_too_little_data(db):
+    """Перші години історії: тренд «мало даних», видно скільки точок є і скільки потрібно."""
+    tr = tools.get_disk_forecast("t-1", drive="C:", now=local(180))["disks"][0]["trend"]
+    assert tr["status"] == "мало даних" and tr["points"] < tr["min_points"]
+    assert "pct_per_day" not in tr
 
 
 def test_errors_are_readable(db):

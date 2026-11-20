@@ -1,6 +1,8 @@
 """Тести сторінки дашборду (web/app.py) без браузера — через вбудований у Streamlit AppTest.
 Тимчасова база; data/oncall.db не чіпають. Запуск: python -m pytest
 """
+import json
+
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
@@ -94,6 +96,49 @@ def test_page_edge_cases(tmp_path, monkeypatch):
     assert "{" not in captions.split("За типами:")[1].split(".")[0]
     assert len(at.metric) == 6                             # CPU, RAM, C:, D:, відповідь, помилки
     assert "агент знає лише розмір" not in captions        # постійні примітки — лише для LLM
+
+
+def disk_chart_lines(path, monkeypatch, now: str | None) -> list[str]:
+    """Назви ліній на всіх графіках сторінки для моменту now (None — «Наживо»).
+    «тренд», «інтервал» і «насправді» бувають лише на графіку диска (блок C)."""
+    monkeypatch.setattr(tools, "DB_PATH", path)
+    st.cache_data.clear()
+    at = AppTest.from_file(APP, default_timeout=60)
+    if now:
+        at.query_params["now"] = now
+    at.run()
+    assert not at.exception
+    return [t.get("name") for chart in at.get("plotly_chart") for t in json.loads(chart.proto.spec)["data"]]
+
+
+def test_disk_chart_actual_line(tmp_path, monkeypatch):
+    """Момент в історії — є «насправді» і тренд; «Наживо» — «насправді» немає;
+    момент після кінця даних — немає ні пунктиру тренду, ні «насправді»."""
+    path = tmp_path / "t.db"
+    two_days(path)                                  # дані 05.01 02:00 – 07.01 01:59 (місц.)
+    middle = disk_chart_lines(path, monkeypatch, "2026-01-06 02:00")
+    assert "тренд" in middle and "насправді (прогноз цього не бачив)" in middle
+    live = disk_chart_lines(path, monkeypatch, None)
+    assert "насправді (прогноз цього не бачив)" not in live
+    late = disk_chart_lines(path, monkeypatch, "2026-01-10 01:59")
+    assert not any(n and n.startswith("тренд") for n in late) and "інтервал 10–90 %" not in late
+    assert "насправді (прогноз цього не бачив)" not in late
+
+
+def test_page_first_hour_of_history(tmp_path, monkeypatch):
+    """Перша година історії: блоки C і E не падають; тренд пояснено «мало даних … з потрібних 6»."""
+    path = tmp_path / "t.db"
+    two_days(path, extra_disks=True)
+    monkeypatch.setattr(tools, "DB_PATH", path)
+    st.cache_data.clear()
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.query_params["now"] = "2026-01-05 03:00"         # дані з 02:00 місцевого
+    at.query_params["drive"] = "C:"
+    at.run()
+    assert not at.exception
+    captions = " ".join(c.value for c in at.caption)
+    assert "мало даних" in captions and "з потрібних 6" in captions
+    assert any(s.value.startswith("E. Що росте") for s in at.subheader)
 
 
 def test_page_late_moment_is_marked_stale(tmp_path, monkeypatch):

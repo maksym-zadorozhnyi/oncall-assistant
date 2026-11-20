@@ -24,7 +24,7 @@ from core import tools  # noqa: E402
 
 WINDOWS = {"6 год": 6, "24 год": 24, "7 днів": 168}
 DASH_POINTS = 1500            # точок на графік дашборду (для LLM — 50, за замовчуванням)
-DISK_HISTORY_DAYS = 14        # скільки історії диска показувати біля прогнозу
+DISK_HISTORY_DAYS = 14        # запасне значення, якщо прогноз не повернув history_days (помилка)
 LOCAL_FMT = "%Y-%m-%d %H:%M"
 
 st.set_page_config(page_title="Сервер — асистент чергового", layout="wide")
@@ -211,6 +211,10 @@ with right:
     chk = pd.DataFrame(rows)
     if not chk.empty:
         st.dataframe(red_rows(chk, chk["ok"] != "так"), hide_index=True)
+        st.caption("http — щохвилинний запит агента до сторінки перевірки сайту: код і час відповіді "
+                   "(не пройшла — код ≠ 200 або довше 2 с); адреса в даних не зберігається, лише код. "
+                   "cert — днів до кінця сертифіката сайту; backup — вік останнього успішного бекапу, год; "
+                   "sql_port — чи відкривається порт SQL Server.")
 show_notes(status)
 
 # ---------------------------------------------------------------------------
@@ -243,10 +247,10 @@ def metric_chart(metric: str, title: str, height: int = 260):
                     line=dict(width=2, color="#1f77b4"))
     if r["imputed_points"]:
         fig.add_scatter(x=ts(r["imputed_points"]), y=[p[1] for p in r["imputed_points"]], mode="markers",
-                        name="заповнено (ETL)", marker=dict(size=8, color="#999999", symbol="circle-open"))
+                        name="заповнений пропуск (ETL)", marker=dict(size=8, color="#999999", symbol="circle-open"))
     if r["outlier_points"]:
         fig.add_scatter(x=ts(r["outlier_points"]), y=[p[1] for p in r["outlier_points"]], mode="markers",
-                        name="викид (ETL)", marker=dict(size=9, color="#d62728"))
+                        name="короткий сплеск (позначка ETL)", marker=dict(size=9, color="#d62728"))
     step = f", середнє по {r['step_min']} хв" if r["step_min"] > 1 else ""
     fig.update_layout(title=f"{title}, {r['unit']}{step}",
                       height=height, margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified",
@@ -254,7 +258,8 @@ def metric_chart(metric: str, title: str, height: int = 260):
     st.plotly_chart(fig)
     # статистика — під графіком (у заголовку довгий рядок обрізався)
     st.caption(f"макс {fmt(r['max']['value'])} о {r['max']['ts_local']}, сер. {fmt(r['mean'])}; "
-               f"заповнено {r['imputed']}, викидів {r['outliers']}, пропусків {r['gaps_total']}")
+               f"заповнених пропусків {r['imputed']}, коротких сплесків {r['outliers']}, "
+               f"незаповнених пропусків {r['gaps_total']}")
     show_notes(r)
 
 
@@ -269,6 +274,10 @@ if "app_response_ms" in m:
         metric_chart("app_response_ms", "Час відповіді сайту")
     with c2:
         metric_chart("app_error_pct", "Помилки сайту")
+    sites = ", ".join(f"{x['site']} (пул {x['app_pool']})" for x in status["sites"])
+    st.caption(f"Сайт — запити користувачів до сайтів сервера ({sites}): середній час відповіді "
+               "за хвилину (мс) і частка запитів, що завершились помилкою (%). Це не те саме, що "
+               "HTTP-перевірка в блоці A: вона — один запит агента щохвилини.")
 with st.expander("Диски і мережа", expanded=EXPAND):
     c1, c2 = st.columns(2)
     for i, d in enumerate(status["disks"]):
@@ -291,7 +300,10 @@ drives = [d["drive"] for d in status["disks"]]
 drive_default = drives.index(params["drive"]) if params.get("drive") in drives else 0
 drive = st.radio("Диск", drives, index=drive_default, horizontal=True)
 fc = call("get_disk_forecast", server=server, drive=drive, now=now, with_line=True)
-disk_start = (now_dt - timedelta(days=DISK_HISTORY_DAYS)).strftime(LOCAL_FMT)
+# історія на графіку — рівно стільки, скільки бачить прогноз (history_days з forecast.yaml)
+history_days = fc.get("history_days", DISK_HISTORY_DAYS)
+disk_start = (now_dt - timedelta(days=history_days)).strftime(LOCAL_FMT)
+st.caption(f"Історія на графіку — {history_days} днів: стільки бачить прогноз.")
 hist = call("get_metric_history", server=server, metric=f"disk_used_pct:{drive}", start=disk_start,
             now=now, max_points=DASH_POINTS)
 stale_mark(fc)
@@ -319,19 +331,40 @@ if not show_error(hist):
     fig.add_scatter(x=ts(hist["series"]), y=[p[1] for p in hist["series"]], mode="lines", name="зайнято, %",
                     line=dict(width=2, color="#1f77b4"))
     ys += [p[1] for p in hist["series"]]
-if d and d.get("trend_line"):
+x_ends = [now_dt]
+# Прогноз малюємо лише на свіжих даних; коли stale — на графіку тільки справжні дані,
+# «зараз» і плашка (прогноз на момент останніх даних — лише текстом нижче, з позначкою)
+if d and d.get("trend_line") and not label:
     tl = d["trend_line"]
+    # обрізаємо там, де пряма дійшла до 100 %: далі диск повний, пласка лінія на 100 % нічого не каже
+    full = next((i for i, p in enumerate(tl) if p[1] >= 100), None)
+    if full is not None:
+        tl = tl[:full + 1]
     x = ts(tl)
     fig.add_scatter(x=x + x[::-1], y=[p[3] for p in tl] + [p[2] for p in tl][::-1], fill="toself",
                     fillcolor="rgba(255,127,14,0.15)", line=dict(width=0), name="інтервал 10–90 %",
                     hoverinfo="skip")
-    fig.add_scatter(x=x, y=[p[1] for p in tl], mode="lines", name="тренд" + label,
+    fig.add_scatter(x=x, y=[p[1] for p in tl], mode="lines", name="тренд",
                     line=dict(width=2, color="#ff7f0e", dash="dash"))
     ys += [p[1] for p in tl]
+    x_ends.append(x[-1])
+
+# Що сталося насправді після «зараз» — лише для моменту в історії і лише на дашборді:
+# той самий інструмент з пізнішим now. Функції для LLM, як і раніше, бачать лише дані до «зараз»
+if now is not None and not fc.get("stale"):
+    horizon = (now_dt + timedelta(hours=168)).strftime(LOCAL_FMT)
+    after = call("get_metric_history", server=server, metric=f"disk_used_pct:{drive}", start=now,
+                 end=horizon, now=horizon, max_points=DASH_POINTS)
+    if "error" not in after and after["series"]:
+        fig.add_scatter(x=ts(after["series"]), y=[p[1] for p in after["series"]], mode="lines",
+                        name="насправді (прогноз цього не бачив)", line=dict(width=2, color="#9e9e9e"))
+        ys += [p[1] for p in after["series"]]
+        x_ends.append(ts(after["series"])[-1])
+
 fig.add_hline(y=thr, line=dict(color="#d62728", width=1, dash="dot"),
               annotation_text=f"{thr} %", annotation_position="top left")
 mark_now(fig)
-x_end = max([now_dt] + (ts(d["trend_line"])[-1:] if d and d.get("trend_line") else []))
+x_end = max(x_ends)
 fig.update_xaxes(range=[datetime.strptime(disk_start, LOCAL_FMT), x_end])
 if full_scale or not ys:
     y_range = [0, 101]
@@ -348,6 +381,15 @@ if "error" not in hist:
 
 if d:
     tr, fg, jp = d["trend"], d["fast_growth"], d["jump"]
+    if tr["status"] == "ok" and not label:
+        # звідки прогноз — один рядок під графіком
+        st.caption(f"Прогноз: пряма по погодинних даних від {tr['from_local']} ({tr['from_reason']}), "
+                   f"{tr['points']} точок; історія для пошуку стрибків — {fc['history_days']} днів.")
+    elif tr["status"] == "мало даних" and not label:
+        # чому пунктиру немає: від початку прямої ще замало погодинних точок
+        st.caption(f"Тренд: мало даних — від {tr['from_local']} ({tr['from_reason']}) погодинних точок: "
+                   f"{tr['points']} з потрібних {tr['min_points']}; пунктиру тренду немає. "
+                   "Питання 2 і 3 нижче рахуються.")
 
     def until(h):
         if h is None:
@@ -369,7 +411,8 @@ if d:
                     f"({fmt(tr['in_24h']['low'])}–{fmt(tr['in_24h']['high'])}); "
                     f"+7 днів — {fmt(tr['in_7d']['pct'], ' %')}; **{until(tr['hours_to_threshold'])}**")
     else:
-        st.markdown(f"**1. Тренд:** {tr['status']} (з {tr['from_local']})")
+        st.markdown(f"**1. Тренд:** {tr['status']} (з {tr['from_local']}; погодинних точок: "
+                    f"{tr['points']} з потрібних {tr['min_points']})")
     if fg["status"] == "ok":
         st.markdown(f"**2. Ріст за {fg['window_min']} хв:** {fmt(fg['pct_per_h'], sign=True)} %/год "
                     f"(зазвичай до {fmt(fg['usual_max_pct_per_h'])}, межа {fmt(fg['limit_pct_per_h'])}) — "
@@ -407,8 +450,8 @@ for col, by, title in ((c1, "cpu", "Топ за CPU"), (c2, "ram", "Топ за 
 # E. Теки
 # ---------------------------------------------------------------------------
 
-st.subheader("E. Що росте за 24 год")
-g = call("get_folder_growth", server=server, now=now)
+st.subheader(f"E. Що росте за {win_label}")
+g = call("get_folder_growth", server=server, period_h=window_h, now=now)
 stale_mark(g)
 if not show_error(g):
     labels = [f["path"] for f in g["folders"]] + [f"інше ({dk['drive']})" for dk in g["disks"]]
