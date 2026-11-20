@@ -9,6 +9,7 @@
     &expand=1 — розгорнути всі згорнуті блоки.
 """
 import json
+import math
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,17 @@ def show_error(result: dict) -> bool:
 
 def ts(series: list) -> list:
     return [pd.Timestamp(p[0]) for p in series]
+
+
+def fmt(value, unit: str = "", digits: int | None = None, sign: bool = False) -> str:
+    """Число для показу; None — «—» (немає даних), а не падіння."""
+    if value is None:
+        return "—"
+    if digits is not None:
+        text = f"{value:+.{digits}f}" if sign else f"{value:.{digits}f}"
+    else:
+        text = f"{value:+}" if sign else f"{value}"
+    return text + unit
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +152,20 @@ if status["stale"]:
 
 st.subheader("A. Стан")
 m = status["metrics"]
-cards = [("CPU", f"{m.get('cpu_pct')} %"), ("RAM", f"{m.get('ram_pct')} %")]
-cards += [(f"Диск {d['drive']}", f"{d['used_pct']} %", f"вільно {d['free_gb']} з {d['total_gb']} ГБ")
-          for d in status["disks"]]
+cards = [("CPU", fmt(m.get("cpu_pct"), " %")), ("RAM", fmt(m.get("ram_pct"), " %"))]
+cards += [(f"Диск {d['drive']}", fmt(d["used_pct"], " %"),
+           f"вільно {fmt(d['free_gb'])} з {fmt(d['total_gb'])} ГБ") for d in status["disks"]]
 if "app_response_ms" in m:
-    cards += [("Відповідь сайту", f"{m['app_response_ms']:.0f} мс"), ("Помилки сайту", f"{m.get('app_error_pct')} %")]
-for col, card in zip(st.columns(len(cards)), cards):
-    col.metric(card[0], card[1], border=True)
-    if len(card) > 2:
-        col.caption(card[2])
+    cards += [("Відповідь сайту", fmt(m["app_response_ms"], " мс", 0)),
+              ("Помилки сайту", fmt(m.get("app_error_pct"), " %"))]
+# Більше 4 карток — два рядки, інакше у вузькому вікні числа обрізаються («2…»)
+per_row = len(cards) if len(cards) <= 4 else math.ceil(len(cards) / 2)
+for i in range(0, len(cards), per_row):
+    row = cards[i:i + per_row]
+    for col, card in zip(st.columns(per_row), row):
+        col.metric(card[0], card[1], border=True)
+        if len(card) > 2:
+            col.caption(card[2])
 
 
 def red_rows(df: pd.DataFrame, bad: pd.Series):
@@ -247,7 +264,12 @@ fc = call("get_disk_forecast", server=server, drive=drive, now=now, with_line=Tr
 disk_start = (now_dt - timedelta(days=DISK_HISTORY_DAYS)).strftime(LOCAL_FMT)
 hist = call("get_metric_history", server=server, metric=f"disk_used_pct:{drive}", start=disk_start,
             now=now, max_points=DASH_POINTS)
-if not show_error(fc) and not show_error(hist):
+disk_ok = not show_error(fc) and not show_error(hist)
+if disk_ok and "error" in fc["disks"][0]:
+    # прогноз для цього диска не порахувався (наприклад, замало даних) — плашка, а не KeyError
+    st.warning(f"Прогноз для {drive}: {fc['disks'][0]['error']}")
+    disk_ok = False
+if disk_ok:
     d = fc["disks"][0]
     thr = fc["threshold_pct"]
     fig = go.Figure()
@@ -281,22 +303,24 @@ if not show_error(fc) and not show_error(hist):
             return f"вже вище {thr} %"
         return f"до {thr} % — {h:.0f} год" if h < 72 else f"до {thr} % — {h / 24:.1f} дн"
 
-    st.markdown(f"**Зараз:** {d['now_pct']} %, вільно {d['now_free_gb']} ГБ")
+    st.markdown(f"**Зараз:** {fmt(d['now_pct'], ' %')}, вільно {fmt(d['now_free_gb'], ' ГБ')}")
     if tr["status"] == "ok":
-        st.markdown(f"**1. Тренд** (з {tr['from_local']}): {tr['pct_per_day']:+} %/добу "
-                    f"({tr['gb_per_day']} ГБ/добу); +24 год — {tr['in_24h']['pct']} % "
-                    f"({tr['in_24h']['low']}–{tr['in_24h']['high']}); +7 днів — {tr['in_7d']['pct']} %; "
-                    f"**{until(tr['hours_to_threshold'])}**")
+        st.markdown(f"**1. Тренд** (з {tr['from_local']}): {fmt(tr['pct_per_day'], sign=True)} %/добу "
+                    f"({fmt(tr['gb_per_day'])} ГБ/добу); +24 год — {fmt(tr['in_24h']['pct'], ' %')} "
+                    f"({fmt(tr['in_24h']['low'])}–{fmt(tr['in_24h']['high'])}); "
+                    f"+7 днів — {fmt(tr['in_7d']['pct'], ' %')}; **{until(tr['hours_to_threshold'])}**")
     else:
         st.markdown(f"**1. Тренд:** {tr['status']} (з {tr['from_local']})")
     if fg["status"] == "ok":
-        st.markdown(f"**2. Ріст за {fg['window_min']} хв:** {fg['pct_per_h']:+} %/год (зазвичай до "
-                    f"{fg['usual_max_pct_per_h']}, межа {fg['limit_pct_per_h']}) — "
+        st.markdown(f"**2. Ріст за {fg['window_min']} хв:** {fmt(fg['pct_per_h'], sign=True)} %/год "
+                    f"(зазвичай до {fmt(fg['usual_max_pct_per_h'])}, межа {fmt(fg['limit_pct_per_h'])}) — "
                     f"{'**НЕЗВИЧНИЙ**' if fg['unusual'] else 'звичайний'}; {until(fg['hours_to_threshold'])}")
+    else:
+        st.markdown(f"**2. Ріст:** {fg['status']}")
     if jp["found"]:
-        st.markdown(f"**3. Регулярний стрибок** ~{jp['size_gb']:.0f} ГБ ({jp['days_seen']} з "
+        st.markdown(f"**3. Регулярний стрибок** ~{fmt(jp['size_gb'], ' ГБ', 0)} ({jp['days_seen']} з "
                     f"{jp['lookback_days']} днів), наступний {jp['next_local']}: вільно буде "
-                    f"{jp['free_then_gb']:.0f} ГБ — **{jp['text']}**")
+                    f"{fmt(jp['free_then_gb'], ' ГБ', 0)} — **{jp['text']}**")
     else:
         st.markdown(f"**3.** {jp['text']}")
     for note in d["notes"]:
@@ -329,13 +353,15 @@ g = call("get_folder_growth", server=server, now=now)
 if not show_error(g):
     labels = [f["path"] for f in g["folders"]] + [f"інше ({d['drive']})" for d in g["disks"]]
     values = [f["growth_gb"] for f in g["folders"]] + [d["other_gb"] for d in g["disks"]]
-    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", text=[f"{v:+.2f} ГБ" for v in values],
+    # None (немає даних на початку періоду) — стовпчика немає, підпис «—»
+    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", text=[fmt(v, " ГБ", 2, sign=True) for v in values],
                            marker_color=["#1f77b4"] * len(g["folders"]) + ["#aaaaaa"] * len(g["disks"])))
     fig.update_layout(height=60 + 35 * len(labels), margin=dict(l=10, r=10, t=10, b=10),
                       yaxis=dict(autorange="reversed"), xaxis_title="ріст, ГБ")
     st.plotly_chart(fig)
-    st.caption("; ".join(f"{d['drive']}: диск {d['growth_gb']:+} ГБ, теки {d['folders_gb']:+} ГБ, "
-                         f"інше {d['other_gb']:+} ГБ" for d in g["disks"]))
+    st.caption("; ".join(f"{d['drive']}: диск {fmt(d['growth_gb'], ' ГБ', sign=True)}, "
+                         f"теки {fmt(d['folders_gb'], ' ГБ', sign=True)}, "
+                         f"інше {fmt(d['other_gb'], ' ГБ', sign=True)}" for d in g["disks"]))
     for note in g["notes"]:
         st.caption(note)
 
@@ -356,7 +382,11 @@ if not show_error(tl):
                                         "level": "рівень", "text": "текст"}), hide_index=True)
     else:
         st.caption("за цей період нічого не сталося")
-    st.caption(f"За типами: {tl['counts']}; шумові події (лише кількість): {tl['noise'] or 'немає'}")
+    type_names = {"event": "події журналу", "service": "зміни служб", "check": "зміни перевірок",
+                  "alert": "алерти"}
+    by_type = ", ".join(f"{type_names[k]} — {v}" for k, v in tl["counts"].items())
+    noise = ", ".join(f"{code} × {n}" for code, n in tl["noise"].items()) or "немає"
+    st.caption(f"За типами: {by_type}. Шумові події (лише кількість): {noise}.")
     for note in tl.get("notes", []):
         st.caption(note)
 
