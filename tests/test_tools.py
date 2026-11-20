@@ -81,6 +81,8 @@ def db(tmp_path, monkeypatch):
             bad = D + 52 <= i < D + 72
             conn.execute("INSERT INTO checks VALUES (?, 1, 'http', ?, ?, ?)",
                          (ts(i, 5), 0 if bad else 1, 20 if bad else 150, "HTTP 503" if bad else "HTTP 200"))
+        # бекап: одна перевірка о D+60 — вік 5 год (останній успішний — о D−240)
+        conn.execute("INSERT INTO checks VALUES (?, 1, 'backup', 1, 5.0, ?)", (ts(D + 60), f"останній успішний: {ts(D - 240)}"))
         conn.executemany("INSERT INTO events VALUES (?, 1, ?, ?, ?, ?, ?)", [
             (ts(D + 10), "System", "DNS", 1014, "Warning", "Name resolution timed out"),
             (ts(D + 20), "System", "DNS", 1014, "Warning", "Name resolution timed out"),
@@ -146,19 +148,19 @@ def test_history_thinning(db):
 
 def test_top_processes_nearest_snapshot(db):
     """Береться найближчий знімок не пізніше at; служба — лише якщо exe належить одній."""
-    r = tools.get_top_processes("t-1", at=local(D + 63), by="cpu")
+    r = tools.get_top_processes("t-1", now=local(D + 63), by="cpu")
     assert r["snapshot_local"] == local(D + 60)
     assert r["cpu_server"] == 95                            # CPU сервера в ту хвилину
     first = r["processes"][0]
     assert first["name"] == "a.exe" and first["service"] == "SvcA"
     svchost = next(p for p in r["processes"] if p["name"] == "svchost.exe")
     assert svchost["service"] is None                       # svchost.exe — дві служби
-    assert tools.get_top_processes("t-1", at=local(D + 63), by="ram")["processes"][0]["name"] == "svchost.exe"
+    assert tools.get_top_processes("t-1", now=local(D + 63), by="ram")["processes"][0]["name"] == "svchost.exe"
 
 
 def test_top_processes_no_snapshot(db):
     """Знімок давніший за 10 хв — зрозуміла помилка, не виняток."""
-    r = tools.get_top_processes("t-1", at=local(D + 100))
+    r = tools.get_top_processes("t-1", now=local(D + 100))
     assert "немає знімка" in r["error"] and r["nearest_snapshot_local"] == local(D + 60)
 
 
@@ -216,6 +218,62 @@ def test_errors_are_readable(db):
     r = tools.get_metric_history("t-1", "cpu_pct", start=local(D + 101), end=local(D + 108))
     assert "немає даних" in r["error"] and r["nearest_data_local"] == local(D + 99)
     assert "error" in tools.get_status("t-1", now="вчора")
+
+
+def test_internal_error_does_not_crash(db, monkeypatch, caplog):
+    """Будь-яка помилка всередині — словник «внутрішня помилка», виняток — у лог."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("бум")
+    monkeypatch.setattr(tools, "find_server", boom)
+    r = tools.get_timeline("t-1")
+    assert r == {"error": "внутрішня помилка: RuntimeError: бум"}
+    assert "get_timeline" in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_parameter_checks(db):
+    """max_points ≥ 2, top ≥ 1, period_h > 0, limit ≥ 1 — інакше зрозуміла помилка; «50» і 50.0 — можна."""
+    assert "max_points" in tools.get_metric_history("t-1", "cpu_pct", max_points=1)["error"]
+    assert "max_points" in tools.get_metric_history("t-1", "cpu_pct", max_points="багато")["error"]
+    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", max_points="50")
+    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", max_points=50.0)
+    assert "top" in tools.get_top_processes("t-1", now=local(D + 60), top=0)["error"]
+    assert "period_h" in tools.get_folder_growth("t-1", period_h=0)["error"]
+    assert "period_h" in tools.get_folder_growth("t-1", period_h=-5)["error"]
+    assert "limit" in tools.get_timeline("t-1", limit=0)["error"]
+
+
+def test_step_min_is_computed_step(db):
+    """step_min — обчислений крок, навіть якщо між першими точками пропуск."""
+    # вікно D+98…D+130: точки 99 і 110…130; крок 4 хв; відрізок 103–106 порожній
+    r = tools.get_metric_history("t-1", "cpu_pct", start=local(D + 98), end=local(D + 130),
+                                 now=local(D + 130), max_points=10)
+    assert r["step_min"] == 4 and len(r["series"]) <= 10
+
+
+def test_gaps_at_window_edges(db):
+    """Пропуск на початку і в кінці вікна теж у gaps (edge: start / end)."""
+    r = tools.get_metric_history("t-1", "cpu_pct", start=local(D + 105), end=local(D + 120), now=local(D + 120))
+    assert r["gaps"][0] == {"from_local": local(D + 105), "to_local": local(D + 110),
+                            "missing_min": 4, "edge": "start"}          # хвилини 106–109
+    r = tools.get_metric_history("t-1", "cpu_pct", start=local(MINUTES - 30), now=local(MINUTES + 20))
+    assert r["gaps"][-1] == {"from_local": local(MINUTES - 1), "to_local": local(MINUTES + 20),
+                             "missing_min": 21, "edge": "end"}
+
+
+def test_status_metric_missing_in_last_minute(db):
+    """Якщо метрики немає саме в хвилину data_until — береться її попереднє значення."""
+    with db_session(db) as conn:
+        conn.execute("DELETE FROM metrics_clean WHERE metric = 'disk_used_pct:C:' AND ts = ?", (ts(D + 60),))
+    r = tools.get_status("t-1", now=local(D + 60))
+    assert r["disks"][0]["used_pct"] == round(disk_used(D + 59), 1)
+    assert any("disk_used_pct:C:" in n for n in r["notes"])
+
+
+def test_backup_age_now(db):
+    """age_h — вік на час перевірки, age_h_now — на момент now."""
+    b = tools.get_status("t-1", now=local(D + 90))["checks"]["backup"]
+    assert b["age_h"] == 5.0 and b["age_h_now"] == 5.5
+    assert b["details"] == f"останній успішний: {local(D - 240)} (місц.)"
 
 
 def test_all_tools_registered():

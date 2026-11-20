@@ -16,6 +16,7 @@ Docstring кожної функції — майбутній опис інстр
 
 import argparse
 import json
+import logging
 import math
 import re
 from functools import wraps
@@ -50,6 +51,7 @@ UNITS = {"cpu_pct": "%", "ram_pct": "%", "app_error_pct": "%", "disk_read_mbs": 
 CHECK_VALUE = {"http": "response_ms", "cert": "days_left", "backup": "age_h", "sql_port": "response_ms"}
 
 TOOLS = {}                      # назва -> функція (на етапі 1 — інструменти для LLM)
+log = logging.getLogger(__name__)
 
 
 class ToolError(Exception):
@@ -61,15 +63,38 @@ class ToolError(Exception):
 
 
 def tool(func):
-    """Реєструє функцію як інструмент і перетворює ToolError на {"error": ...}."""
+    """Реєструє функцію як інструмент. Будь-яка помилка -> {"error": ...}, а не падіння:
+    LLM може передати дивні параметри, і бот не має падати.
+    ToolError — зрозуміле пояснення; інша помилка — «внутрішня», а сам виняток — у лог."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
         except ToolError as e:
             return {"error": str(e), **e.extra}
+        except Exception as e:
+            log.exception("інструмент %s(%s, %s) упав", func.__name__, args, kwargs)
+            return {"error": f"внутрішня помилка: {type(e).__name__}: {e}"}
     TOOLS[func.__name__] = wrapper
     return wrapper
+
+
+def as_number(value, name: str, minimum: float, integer: bool = True, strict: bool = False):
+    """Параметр-число з перевіркою: «50», 50.0 -> 50. Менше за minimum (або рівне при
+    strict) чи не число — зрозуміла помилка."""
+    try:
+        x = float(value)
+        if integer:
+            if x != int(x):
+                raise ValueError
+            x = int(x)
+    except (TypeError, ValueError, OverflowError):
+        x = None
+    if x is None or (x <= minimum if strict else x < minimum):
+        sign = ">" if strict else "≥"
+        raise ToolError(f"{name} має бути {'цілим ' if integer else ''}числом {sign} {minimum:g}, "
+                        f"а не «{value}»")
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +299,10 @@ def check_states(conn, server_id: int, now: pd.Timestamp) -> dict:
         if r is not None:
             out[t] = {"ok": bool(r["ok"]), CHECK_VALUE[t]: num(r["value"], 1),
                       "details": localize_text(r["details"]), "checked_local": loc(r["ts"])}
+            if t == "backup" and r["value"] is not None:
+                # перевірка щогодинна: age_h — вік на час перевірки, age_h_now — на момент now
+                passed_h = (now - parse_db(r["ts"])).total_seconds() / 3600
+                out[t]["age_h_now"] = num(r["value"] + max(passed_h, 0), 1)
     return out
 
 
@@ -284,9 +313,17 @@ def server_status(conn, s, now) -> dict:
     # Живий режим: «замовк» відносно справжнього годинника; історія — відносно now
     ref = pd.Timestamp.now(tz="UTC") if live else t
     silent_min = (ref - until_t).total_seconds() / 60
-    rows = conn.execute("SELECT metric, value FROM metrics_clean WHERE server_id = ? AND ts = ?",
-                        (s["id"], until)).fetchall()
-    values = {r["metric"]: r["value"] for r in rows}
+    # Кожна метрика — останнє значення не пізніше now (а не лише в хвилину data_until:
+    # якщо якоїсь метрики в цю хвилину немає, беремо її попереднє значення)
+    values, older = {}, []
+    for m in metric_names(conn, s["id"]):
+        r = conn.execute("SELECT ts, value FROM metrics_clean WHERE server_id = ? AND metric = ? AND ts < ? "
+                         "ORDER BY ts DESC LIMIT 1", (s["id"], m, cutoff(t))).fetchone()
+        if r is None:
+            continue
+        values[m] = r["value"]
+        if r["ts"] != until:
+            older.append(f"{m}: останнє значення о {loc(r['ts'])}")
     # метрики сервера — без «:» (disk_used_pct:C: і disk_free_gb:C: ідуть у disks)
     metrics = {m: num(v) for m, v in sorted(values.items()) if ":" not in m}
     disks = []
@@ -298,7 +335,7 @@ def server_status(conn, s, now) -> dict:
                       "total_gb": num(tot["total_gb"], 1) if tot else None})
     services = service_states(conn, s["id"], t)
     checks = check_states(conn, s["id"], t)
-    notes = []
+    notes = older
     missing = [c for c in CHECK_VALUE if c not in checks]
     if missing:
         notes.append(f"перевірок {', '.join(missing)} на цьому сервері немає")
@@ -353,13 +390,14 @@ def window(t_now: pd.Timestamp, start, end, hours: float = DEFAULT_WINDOW_H) -> 
     return start_t, end_t
 
 
-def thin(s: pd.Series, max_points: int) -> pd.Series:
-    """Проріджує ряд до max_points: середнє по рівних відрізках часу."""
+def thin(s: pd.Series, max_points: int) -> tuple[pd.Series, int]:
+    """Проріджує ряд до max_points: середнє по рівних відрізках часу.
+    Повертає (ряд, крок у хвилинах); 1 — ряд без змін."""
     if len(s) <= max_points:
-        return s
+        return s, 1
     span_min = (s.index[-1] - s.index[0]).total_seconds() / 60 + 1
     step = math.ceil(span_min / max_points)
-    return s.resample(f"{step}min", origin=s.index[0]).mean().dropna()
+    return s.resample(f"{step}min", origin=s.index[0]).mean().dropna(), step
 
 
 def pick_points(df: pd.DataFrame, mask: pd.Series, limit: int, median: float) -> list:
@@ -386,6 +424,7 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
     gaps (пропуски даних від–до), series — проріджений ряд [місцевий час, значення]
     (середнє по відрізках step_min хвилин).
     """
+    max_points = as_number(max_points, "max_points", 2)
     with connect() as conn:
         s = find_server(conn, server)
         t_now, _ = resolve_now(conn, s, now)
@@ -405,16 +444,22 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts")
     v = df["value"]
-    # Пропуски: сусідні хвилини, між якими нема даних
+    # Пропуски: from/to — останні дані перед пропуском і перші після; на краях вікна —
+    # сама межа вікна (edge: start / end), щоб чесно сказати «немає даних за 14:00»
+    minute = pd.Timedelta(minutes=1)
     gaps = []
+    if v.index[0] > start_t + minute:
+        gaps.append({"from_local": loc(start_t), "to_local": loc(v.index[0]),
+                     "missing_min": int((v.index[0] - start_t) / minute) - 1, "edge": "start"})
     diffs = v.index.to_series().diff()
-    for ts, d in diffs[diffs > pd.Timedelta(minutes=1)].items():
-        gaps.append({"from_local": loc(ts - d), "to_local": loc(ts),
-                     "missing_min": int(d.total_seconds() / 60) - 1})
+    for ts, d in diffs[diffs > minute].items():
+        gaps.append({"from_local": loc(ts - d), "to_local": loc(ts), "missing_min": int(d / minute) - 1})
+    if v.index[-1] < end_t:
+        gaps.append({"from_local": loc(v.index[-1]), "to_local": loc(end_t),
+                     "missing_min": int((end_t - v.index[-1]) / minute), "edge": "end"})
     median = float(v.median())
     mark_limit = max(10, max_points // 5)
-    series = thin(v, max_points)
-    step_min = 1 if len(series) == len(v) else int((series.index[1] - series.index[0]).total_seconds() / 60)
+    series, step_min = thin(v, max_points)
     return {"server": server, "metric": metric, "unit": unit_of(metric),
             "from_local": loc(start_t), "to_local": loc(end_t),
             "first": num(v.iloc[0]), "last": num(v.iloc[-1]), "change": num(v.iloc[-1] - v.iloc[0]),
@@ -436,12 +481,13 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
 # ---------------------------------------------------------------------------
 
 @tool
-def get_top_processes(server: str, at: str | None = None, by: str = "cpu", top: int = 5) -> dict:
-    """Процеси з найбільшим навантаженням у знімку, найближчому до моменту at.
+def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top: int = 5) -> dict:
+    """Процеси з найбільшим навантаженням у знімку, найближчому до моменту now.
 
     Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «Що вантажило о 14:07?».
-    Параметри: at — місцевий час (None — останні дані); by — "cpu" або "ram"; top — скільки процесів.
-    Знімок береться не пізніше at і не давніший за 10 хв; інакше — помилка «немає знімка».
+    Параметри: now — момент, місцевий час (None — останні дані); by — "cpu" або "ram";
+    top — скільки процесів. Знімок береться не пізніше now і не давніший за 10 хв;
+    інакше — помилка «немає знімка».
     Повертає: snapshot_local (час знімка), cpu_server і ram_server_pct (CPU і RAM сервера
     в ту хвилину — щоб порівняти з процесом), processes: name, pid, cpu_pct (0–100 % від
     усього CPU), ram_mb, app_pool (для w3wp.exe), service (служба, якщо цей exe належить
@@ -449,9 +495,10 @@ def get_top_processes(server: str, at: str | None = None, by: str = "cpu", top: 
     """
     if by not in ("cpu", "ram"):
         raise ToolError(f"by має бути cpu або ram, а не «{by}»")
+    top = as_number(top, "top", 1)
     with connect() as conn:
         s = find_server(conn, server)
-        t, _ = resolve_now(conn, s, at)
+        t, _ = resolve_now(conn, s, now)
         lo = db_ts(t - pd.Timedelta(minutes=SNAPSHOT_MAX_MIN))
         snap = conn.execute("SELECT MAX(ts) FROM process_snapshots WHERE server_id = ? AND ts < ? AND ts >= ?",
                             (s["id"], cutoff(t), lo)).fetchone()[0]
@@ -463,7 +510,7 @@ def get_top_processes(server: str, at: str | None = None, by: str = "cpu", top: 
         order = "cpu_pct" if by == "cpu" else "ram_mb"
         rows = conn.execute(f"SELECT name, pid, cpu_pct, ram_mb, app_pool FROM process_snapshots "
                             f"WHERE server_id = ? AND ts = ? ORDER BY {order} DESC LIMIT ?",
-                            (s["id"], snap, int(top))).fetchall()
+                            (s["id"], snap, top)).fetchall()
         minute = db_ts(parse_db(snap).floor("min"))
         m = {r["metric"]: r["value"] for r in conn.execute(
             "SELECT metric, value FROM metrics_clean WHERE server_id = ? AND ts = ? "
@@ -511,10 +558,11 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
     зайнятого місця зі зміни вільного), folders_gb (сума тек) і other_gb (росте щось
     поза відстежуваними теками).
     """
+    period_h = as_number(period_h, "period_h", 0, integer=False, strict=True)
     with connect() as conn:
         s = find_server(conn, server)
         t, _ = resolve_now(conn, s, now)
-        t0 = t - pd.Timedelta(hours=float(period_h))
+        t0 = t - pd.Timedelta(hours=period_h)
         now_sizes, start_sizes = sizes_at(conn, s["id"], t), sizes_at(conn, s["id"], t0)
         notes = ["агент знає лише розмір відстежуваних тек, а не окремі файли"]
         folders = []
@@ -676,6 +724,7 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
     зміна результату перевірки; alert — алерт), source, code, level, text.
     noise — часті шумові події (1014, 37) лише кількістю; counts — кількість за типами.
     """
+    limit = as_number(limit, "limit", 1)
     with connect() as conn:
         s = find_server(conn, server)
         t_now, _ = resolve_now(conn, s, now)
@@ -716,7 +765,7 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
     items.sort(key=lambda x: x["ts"])
     counts = {k: sum(1 for x in items if x["type"] == k) for k in ("event", "service", "check", "alert")}
     total = len(items)
-    items = items[-int(limit):]
+    items = items[-limit:]
     # час у відповіді — місцевий, першим полем
     items = [{"ts_local": loc(x["ts"]), **{k: v for k, v in x.items() if k != "ts"}} for x in items]
     out = {"server": server, "from_local": loc(start_t), "to_local": loc(end_t),
@@ -735,7 +784,6 @@ def main() -> None:
     parser.add_argument("function", choices=sorted(TOOLS))
     parser.add_argument("--server")
     parser.add_argument("--now", help="момент, місцевий час: \"2026-11-10 08:00\"")
-    parser.add_argument("--at", help="для get_top_processes")
     parser.add_argument("--metric")
     parser.add_argument("--start")
     parser.add_argument("--end")

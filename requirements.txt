@@ -10,3 +10,7 @@ PyYAML==6.0.3          # читання rules.yaml, ontology.yaml, config.yaml
 
 # --- Фаза 2: ETL, прогноз, правила ---
 pytest==9.2.0          # автоматичні тести: python -m pytest
+
+# --- Етап 0: функції-інструменти і дашборд ---
+streamlit==1.67.0      # дашборд: streamlit run web/app.py
+plotly==7.1.0          # інтерактивні графіки дашборду (наведення, масштаб)
