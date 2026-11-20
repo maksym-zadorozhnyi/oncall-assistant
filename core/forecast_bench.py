@@ -117,7 +117,8 @@ def plot_moment(used: pd.Series, free: pd.Series, after: pd.Series, moment: pd.T
         fut_t = np.linspace(0, 168, 200)
         to_time = lambda ts: [moment + pd.Timedelta(hours=float(h)) for h in ts]
         ax1.plot(to_time(past_t), [line.at(h)[0] for h in past_t], "--", lw=1.2, color=C_TREND)
-        fut = np.array([fc.clip_pct(line.at(h)) for h in fut_t])
+        sh = tr.get("shift", 0.0)          # завершені різкі підйоми — сходинка вгору
+        fut = np.array([fc.clip_pct(tuple(v + sh for v in line.at(h))) for h in fut_t])
         ax1.plot(to_time(fut_t), fut[:, 0], "-", lw=2, color=C_TREND, label="тренд (питання 1)")
         ax1.fill_between(to_time(fut_t), fut[:, 1], fut[:, 2], color=C_TREND, alpha=0.15, lw=0,
                          label="інтервал 10–90 %")
@@ -193,6 +194,25 @@ def plot_history_moment(server: str, drive: str, moment_text: str) -> Path:
 # Оцінка: моменти, попередження, рядки результатів
 # ---------------------------------------------------------------------------
 
+HOLD_MIN = 5          # «дійшов до 90 %» — тримається щонайменше 5 хв поспіль (як у правилах)
+
+
+def sustained_above(used: pd.Series, thr: float) -> pd.Series:
+    """True у хвилину, коли рівень ≥ thr уже HOLD_MIN хвилин поспіль (кінець такої серії)."""
+    return (used >= thr).astype(int).rolling(HOLD_MIN).sum().eq(HOLD_MIN)
+
+
+def first_reach(used: pd.Series, thr: float, after: pd.Timestamp | None = None) -> pd.Timestamp | None:
+    """Момент, коли диск дійшов до порогу (початок першої серії ≥ thr завдовжки HOLD_MIN хв),
+    не раніше after. Одна хвилина шуму на 90,0 % — не «дійшов»."""
+    s = sustained_above(used, thr)
+    if after is not None:
+        s = s[used.index >= after + pd.Timedelta(minutes=HOLD_MIN - 1)]
+    if not s.any():
+        return None
+    return s[s].index[0] - pd.Timedelta(minutes=HOLD_MIN - 1)
+
+
 def moments_for(index: pd.DatetimeIndex, eval_from: pd.Timestamp, dense_events: list) -> list:
     """Моменти перевірки: кожні 6 год; у ±6 год від подій — кожні 5 хв."""
     end = index[-1] - pd.Timedelta(hours=1)
@@ -235,6 +255,7 @@ def evaluate_series(used: pd.Series, free: pd.Series, moments: list, actions: li
     thr = cfg["threshold_pct"]
     hist = pd.Timedelta(days=cfg["history_days"])
     last = used.index[-1]
+    reach = sustained_above(used, thr).to_numpy()     # «дійшов до 90 %» (≥ 5 хв поспіль)
     # часи втручань як numpy datetime (UTC без поясу) — для швидкого порівняння
     acts = (pd.DatetimeIndex(sorted(actions)).tz_convert(None).to_numpy() if actions
             else np.array([], dtype="datetime64[ns]"))
@@ -251,13 +272,13 @@ def evaluate_series(used: pd.Series, free: pd.Series, moments: list, actions: li
             r = fc.METHODS[name]().predict(u, f, m, cfg)
             ms = (time.perf_counter() - t0) * 1000
             warn, reasons, promised = warn_info(r, cfg)
-            # чи дійде диск до 90 % за обіцяний час (але не менше 72 год)
+            # чи дійде диск до 90 % (≥ 5 хв поспіль) за обіцяний час (але не менше 72 год)
             window = pd.Timedelta(hours=max(promised or 0, 72))
-            fut = values[(used.index > m) & (used.index <= m + window)]
+            fut = reach[(used.index > m) & (used.index <= m + window + pd.Timedelta(minutes=HOLD_MIN))]
             m_np = np.datetime64(m.tz_convert(None))
             row = {**meta, "moment": m, "method": name, "now_pct": now_pct, "warn": warn,
                    "reasons": reasons, "promised_h": promised,
-                   "reached_in_window": bool(len(fut) and fut.max() >= thr),
+                   "reached_in_window": bool(fut.any()),
                    # втручання у вікні: якщо почистили раніше, ніж диск дійшов до 90 %,
                    # попередження не можна назвати хибним — невідомо, що було б далі
                    "action_in_window": bool(((acts > m_np)
@@ -288,17 +309,22 @@ def evaluate_bench_run(args: tuple) -> tuple[list[dict], dict]:
     cfg = fc.load_config()
     run = generate(seed, situation, k)
     used, free = run["used"], run["free"]
-    t90 = used[used >= cfg["threshold_pct"]].index.min() if (used >= cfg["threshold_pct"]).any() else None
+    # дійшов до 90 % — лише після початку перевірки (у тижні розігріву моментів немає)
+    t90 = first_reach(used, cfg["threshold_pct"], after=run["eval_from"])
     ev = run["events"]
     dense = [ev.get("start"), ev.get("end"), ev.get("jump_at"), t90]
     moments = moments_for(used.index, run["eval_from"], dense)
     meta = {"source": "bench", "seed": seed, "run": run["id"], "situation": situation,
             "drive": run["drive"]}
-    rows = evaluate_series(used, free, moments, [a for a, _ in run["actions"]], cfg, meta)
+    # Втручання — лише позапланові дії адміністратора. Щотижневе прибирання — звичайна,
+    # передбачувана поведінка: не виключаємо ні з MAE, ні з хибних тривог
+    admin = [a for a, kind in run["actions"] if kind == "адміністратор почистив"]
+    rows = evaluate_series(used, free, moments, admin, cfg, meta)
     info = {"source": "bench", "seed": seed, "run": run["id"], "situation": situation,
             "drive": run["drive"], "t90": t90, "start": ev.get("start"), "end": ev.get("end"),
             "jump_at": ev.get("jump_at"), "jump_fits": run["jump_fits"],
-            "actions": len(run["actions"]), "info": json.dumps(run["info"], ensure_ascii=False)}
+            "actions": len(admin), "weekly_cleanups": run["info"].get("weekly_cleanups", 0),
+            "info": json.dumps(run["info"], ensure_ascii=False)}
     return rows, info
 
 
@@ -384,11 +410,10 @@ def run_history() -> None:
         series = {(name, d): load_full_disk(conn, sid, d) for sid, name, d in disks}
     for (name, drive), (used, free) in series.items():
         incs = [i for i in incidents if i["server"] == name and i["drive"] == drive]
-        # Втручання — з даних: різке падіння, яке не є видаленням попереднього стрибка
-        steps = fc.find_steps(used, free, cfg)
-        actions = [s["end"] for s in steps if s["size_pp"] < 0
-                   and not any(fc.removal_after(r, steps, cfg) is s for r in steps if r["size_pp"] > 0)]
-        above = used >= thr
+        # Втручання — лише позапланові дії адміністратора: кінець інциденту диска
+        # з ключа відповідей («помітив і почистив»); щотижневе прибирання — ні
+        actions = [i["end"] for i in incs if i["situation"] != "S7"]
+        above = sustained_above(used, thr)
         crossings = list(used.index[above & ~above.shift(fill_value=False)])
         dense = [i["start"] for i in incs] + [i["end"] for i in incs] + \
                 [i["jump_at"] for i in incs if i["jump_at"] is not None] + crossings
@@ -402,7 +427,7 @@ def run_history() -> None:
         all_rows += rows
         for i in incs:
             win = used[(used.index >= i["start"]) & (used.index <= i["end"])]
-            t90 = win[win >= thr].index.min() if (win >= thr).any() else None
+            t90 = first_reach(win, thr)
             all_runs.append({"source": "history", "seed": 0, "run": f"{name} {drive}",
                              "situation": i["situation"], "drive": drive, "t90": t90,
                              "start": i["start"], "end": i["end"], "jump_at": i["jump_at"],
@@ -468,6 +493,15 @@ def run_outcomes(bt: pd.DataFrame, runs: pd.DataFrame, thr: float) -> pd.DataFra
                 else:
                     first = streak_start(pre, pre["warn"], w["moment"].max())
                     res["lead_h"] = (run["t90"] - first).total_seconds() / 3600
+                    # Похибка прогнозованого моменту 90 %: що обіцяв прогноз («до 90 % — N год»)
+                    # і скільки було насправді — у першому попередженні і по всій серії
+                    streak = pre[(pre["moment"] >= first) & pre["warn"]]
+                    actual = (run["t90"] - streak["moment"]).dt.total_seconds() / 3600
+                    err = streak["promised_h"] - actual
+                    res["t90_promised_first_h"] = float(streak["promised_h"].iloc[0])
+                    res["t90_actual_first_h"] = float(actual.iloc[0])
+                    res["t90_err_h"] = float(err.iloc[0])
+                    res["t90_err_med_h"] = float(err.abs().median())
             false = (g["warn"] & (g["now_pct"] < thr) & ~g["reached_in_window"]
                      & ~g["action_in_window"].astype(bool))
             res["false_moments"] = int(false.sum())
@@ -482,6 +516,26 @@ def run_outcomes(bt: pd.DataFrame, runs: pd.DataFrame, thr: float) -> pd.DataFra
                                       .total_seconds() / 3600) if nf.any() else np.nan
             out.append(res)
     return pd.DataFrame(out)
+
+
+def situation_summary(oc: pd.DataFrame, mt: pd.DataFrame) -> pd.DataFrame:
+    """Короткий підсумок по ситуаціях (лінійний метод) — для таблиці seed 1 / 2 / 3."""
+    lin = oc[oc["method"] == "linear"]
+    rows = []
+    for s, g in lin.groupby("situation"):
+        r = g[g["reached"]]
+        m = mt[(mt["situation"] == s) & (mt["method"] == "linear")]
+        row = {"situation": s, "runs": len(g), "reached": len(r), "in_time": int((~r["miss"]).sum()),
+               "lead_mean_h": r["lead_h"].mean(), "lead_min_h": r["lead_h"].min(),
+               "misses": int(r["miss"].sum()), "false_runs": int((g["false_episodes"] > 0).sum()),
+               "false_episodes": int(g["false_episodes"].sum())}
+        for h in HORIZONS:
+            row[f"mae{h}"] = float(m[f"mae{h}"].iloc[0]) if not m.empty else np.nan
+        if "t90_err_med_h" in g:
+            row["t90_err_first_med_h"] = r["t90_err_h"].abs().median() if len(r) else np.nan
+            row["t90_err_all_med_h"] = r["t90_err_med_h"].median() if len(r) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def mae_table(bt: pd.DataFrame) -> pd.DataFrame:
@@ -705,7 +759,8 @@ def plot_evolution(server: str, drive: str, moments: list[str], title: str, png:
         if tr.get("status") == "ok":
             line = tr["line"]
             ts = np.linspace(0, 168, 100)
-            fut = np.array([fc.clip_pct(line.at(h)) for h in ts])
+            sh = tr.get("shift", 0.0)
+            fut = np.array([fc.clip_pct(tuple(v + sh for v in line.at(h))) for h in ts])
             tt = [moment + pd.Timedelta(hours=float(h)) for h in ts]
             ax.plot(tt, fut[:, 0], "-", lw=2, color=C_TREND)
             ax.fill_between(tt, fut[:, 1], fut[:, 2], color=C_TREND, alpha=0.15, lw=0)
@@ -777,6 +832,40 @@ def build_report(seed: int) -> None:
     conclusions = OUT_DIR / "conclusions.md"
     if conclusions.exists():
         L += [conclusions.read_text(encoding="utf-8").strip(), ""]
+
+    # --- Що змінено під час налаштування + seed 1 / seed 2 (версія 1) / seed 3 ---
+    changes = OUT_DIR / "changes.md"
+    if changes.exists():
+        L += [changes.read_text(encoding="utf-8").strip(), ""]
+    seeds = {}
+    for s_ in (1, seed):
+        b_ = bt_all[(bt_all["source"] == "bench") & (bt_all["seed"] == s_)]
+        r_ = runs_all[(runs_all["source"] == "bench") & (runs_all["seed"] == s_)]
+        if not b_.empty:
+            seeds[s_] = situation_summary(run_outcomes(b_, r_, thr), mae_table(b_)).set_index("situation")
+    v1_path = OUT_DIR / "summary_v1_seed2.csv"
+    v1 = pd.read_csv(v1_path).set_index("situation") if v1_path.exists() else None
+    if seeds and v1 is not None:
+        cols = [("seed 1 (налаштування)", seeds.get(1)), ("seed 2 (версія 1)", v1),
+                (f"seed {seed} (фінал)", seeds.get(seed))]
+        L += ["### Seed 1 / seed 2 (версія 1) / seed 3 поруч (лінійний метод)", "",
+              "Версія 1 — старий код і старі визначення (одна хвилина ≥ 90 % = «дійшов»; щотижневе "
+              "прибирання виключалось як втручання), тому порівнювати її з seed 1 / 3 можна лише "
+              "приблизно.", "",
+              "| Ситуація | Вчасно / дійшли: " + " · ".join(n for n, _ in cols) +
+              " | Прогонів з хибною тривогою: " + " · ".join(n for n, _ in cols) +
+              " | MAE +24 год: " + " · ".join(n for n, _ in cols) + " |", "|---|---|---|---|"]
+        for s_ in sorted(SITUATIONS):
+            def cell(df, f):
+                if df is None or s_ not in df.index:
+                    return "—"
+                r = df.loc[s_]
+                return f(r)
+            a = " · ".join(cell(d, lambda r: f"{int(r['in_time'])}/{int(r['reached'])}") for _, d in cols)
+            b = " · ".join(cell(d, lambda r: f"{int(r['false_runs'])}") for _, d in cols)
+            c = " · ".join(cell(d, lambda r: "—" if pd.isna(r["mae24"]) else f"{r['mae24']:.2f}") for _, d in cols)
+            L.append(f"| {s_} | {a} | {b} | {c} |")
+        L += [""]
     L += ["## Як перевіряли", "",
           f"- **Сценарний стенд:** {runs['run'].nunique()} коротких незалежних прогонів "
           f"(по {RUNS_PER_SITUATION} на ситуацію), seed {seed}. Пороги налаштовано на інших прогонах "
@@ -786,15 +875,20 @@ def build_report(seed: int) -> None:
           "- **Моменти перевірки:** кожні 6 год від 7-го дня; у ±6 год навколо початку і кінця ситуації, "
           "моменту 90 % і критичного бекапу — кожні 5 хв. У кожен момент метод бачить лише дані до нього.",
           "- **Методи:** лінійний (робочий, три питання); наївні «як зараз» і «як учора о цій порі» — лінійки.",
+          f"- **Дійшов до {thr} %** — рівень ≥ {thr} % тримається щонайменше {HOLD_MIN} хв поспіль "
+          "(як у правилах; одна хвилина шуму — не рахується), і лише після початку перевірки.",
           f"- **Попередження** — прогнозований час до {thr} % < 72 год (за трендом, за незвичним ростом "
           f"або «після наступного стрибка диск буде вище {thr} %»). **Вчасно** — попередження було "
           f"до моменту {thr} %; **за скільки** — від початку безперервної серії попереджень до "
           f"моменту {thr} %. **Хибна тривога** — попередження, після якого диск не дійшов до {thr} % "
-          "ні за обіцяний час, ні за 72 год (і ніхто не втручався). **Пропуск** — дійшов без попередження.",
-          "- **MAE «до втручання»:** якщо між моментом і горизонтом було прибирання людиною або "
-          "щотижневе прибирання, цей горизонт у MAE не входить — прогноз відповідає на «що буде, якщо "
-          "ніхто нічого не зробить». Видалення бекапу і тимчасового файлу — частина звичайної "
-          "поведінки, не виключаються. Щільні моменти (кожні 5 хв біля подій) мають у MAE більшу вагу.",
+          "ні за обіцяний час, ні за 72 год (і адміністратор не втручався). **Пропуск** — дійшов без "
+          "попередження. **Похибка моменту 90 %** — обіцяний час («до 90 % — N год») мінус фактичний.",
+          "- **MAE «до втручання»:** якщо між моментом і горизонтом адміністратор позапланово почистив "
+          "диск, цей горизонт у MAE не входить — дію людини з ряду не передбачити. Щотижневе прибирання, "
+          "видалення бекапу і тимчасового файлу — передбачувана поведінка, не виключаються "
+          f"(щотижневих прибирань у прогонах: {int(runs['weekly_cleanups'].sum()) if 'weekly_cleanups' in runs else '—'}; "
+          f"дій адміністратора: {int(runs['actions'].sum())}). Щільні моменти (кожні 5 хв біля подій) "
+          "мають у MAE більшу вагу.",
           ""]
 
     # --- Підсумок по ситуаціях ---
@@ -813,6 +907,43 @@ def build_report(seed: int) -> None:
     L += ["", "Наївні методи попереджають лише тоді, коли диск уже вище порогу, тому «вчасно» в них "
           "немає за визначенням; для них показуємо лише MAE.", "",
           "![Час попередження](forecast/lead_times.png)", ""]
+
+    # --- Похибка моменту 90 % ---
+    if "t90_err_h" in lin:
+        L += [f"## Похибка прогнозованого моменту {thr} % (лінійний метод)", "",
+              f"Саме це бот напише черговому: «до {thr} % — N год». Похибка = обіцяно − насправді "
+              "(+ — прогноз обіцяв пізніше, ніж сталося; − — раніше).", "",
+              "| Ситуація | Прогонів | Перше попередження: обіцяв (медіана) | Насправді (медіана) | "
+              "Похибка першого, медіана |·| | Найбільша |·| | Похибка по всій серії попереджень, медіана |·| |",
+              "|---|---|---|---|---|---|---|"]
+        for s in sorted(SITUATIONS):
+            r = lin[(lin["situation"] == s) & lin["reached"] & lin["t90_err_h"].notna()]
+            if r.empty:
+                continue
+            L.append(f"| {s} | {len(r)} | {fmt_h(r['t90_promised_first_h'].median())} | "
+                     f"{fmt_h(r['t90_actual_first_h'].median())} | {fmt_h(r['t90_err_h'].abs().median())} | "
+                     f"{fmt_h(r['t90_err_h'].abs().max())} | {fmt_h(r['t90_err_med_h'].median())} |")
+        L += ["", "Перше попередження бот дає, коли до порогу ще далеко, тож і похибка першого "
+              "найбільша; ближче до 90 % прогноз уточнюється (остання колонка).", ""]
+
+    # --- Кожен пропуск окремо ---
+    misses = lin[lin["reached"] & lin["miss"]]
+    L += ["## Пропуски — кожен окремо", ""]
+    if misses.empty:
+        L += ["Пропусків немає.", ""]
+    for _, m in misses.iterrows():
+        run = runs[runs["run"] == m["run"]].iloc[0]
+        g = bt[(bt["run"] == m["run"]) & (bt["method"] == "linear") & (bt["moment"] < run["t90"])]
+        g = g.sort_values("moment").tail(4)
+        L += [f"**{m['run']}** ({SITUATIONS[m['situation']]}): дійшов до {thr} % о "
+              f"{run['t90']:%d.%m %H:%M}; параметри прогону: `{run['info']}`. Останні прогнози перед цим:", "",
+              "| Момент | Рівень, % | Попередження | Причина | Обіцяно, год |", "|---|---|---|---|---|"]
+        for _, row in g.iterrows():
+            promised = "—" if pd.isna(row["promised_h"]) else f"{row['promised_h']:.1f}"
+            reasons = row["reasons"] if isinstance(row["reasons"], str) else "—"
+            L.append(f"| {row['moment']:%d.%m %H:%M} | {row['now_pct']:.1f} | "
+                     f"{'так' if row['warn'] else 'ні'} | {reasons} | {promised} |")
+        L += [""]
 
     # --- S7 ---
     s7 = lin[(lin["situation"] == "S7")]

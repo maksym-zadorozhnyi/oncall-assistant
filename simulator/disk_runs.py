@@ -89,9 +89,12 @@ def template_backup(rng, base_level: float | None = None) -> tuple[dict, str, di
     окреме завдання видаляє старіші за retention_days."""
     total = rng.choice([200, 500, 1000])
     size_pct = rng.uniform(5, 12)
-    retention = rng.randint(4, 7)
+    # Якщо видалення старих припадає на ранок наступної доби, на диску буває на один
+    # бекап більше: пік = рівень + 2 бекапи. Він має бути ≤ 85 % (інакше «звичайний»
+    # диск сам доходить до 90 % — так було у версії 1, прогони S3-01 і S7-24)
+    retention = rng.randint(4, max(4, min(7, int((83 - 2 * size_pct) // size_pct))))
     lo = retention * size_pct + 2
-    hi = max(lo + 1, 85 - size_pct)
+    hi = max(lo + 1, 85 - 2 * size_pct)
     base = base_level if base_level is not None else rng.uniform(lo, hi)
     base = min(max(base, lo), hi)
     data_gb = size_pct / 100 * total / 0.15
@@ -301,6 +304,7 @@ def generate(seed: int, situation: str, k: int) -> dict:
         info["spike_min"] = spike["minutes"]
     info.update({"normal_days": normal_days, "noise_pp": round(noise, 3)})
     info.update({k: v for k, v in params.items() if k in ("burst_factor", "fill_minutes")})
+    info["weekly_cleanups"] = sum(1 for _, kind in actions if kind == "щотижневе прибирання")
     return {"id": f"{situation}-{k:02d}", "seed": seed, "situation": situation, "drive": drive,
             "used": pd.Series(used.to_numpy(), index=index.tz_convert("UTC")),
             "free": pd.Series(free.to_numpy(), index=index.tz_convert("UTC")),

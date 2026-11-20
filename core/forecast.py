@@ -100,11 +100,21 @@ def tod_diff(a: int, b: int) -> int:
 # Різкі зміни: підйоми (стрибки) і падіння (прибирання)
 # ---------------------------------------------------------------------------
 
+def bins(used: pd.Series, cfg: dict) -> pd.Series:
+    """Останнє значення кожного 10-хв відрізка — лише повних відрізків. Неповний
+    останній відрізок (момент посередині відрізка) відкидаємо: у ньому лише кілька
+    хвилин, і ріст, що триває, виглядав би як «рівний» відрізок (кінець сходинки)."""
+    bin_min = cfg["steps"]["bin_min"]
+    x = used.resample(f"{bin_min}min").last().dropna()
+    if len(x) and x.index[-1] + pd.Timedelta(minutes=bin_min - 1) > used.index[-1]:
+        x = x.iloc[:-1]
+    return x
+
 def find_steps(used: pd.Series, free: pd.Series, cfg: dict) -> list[dict]:
     """Різкі підйоми і падіння. Кожна подія: start, end, size_pp (+ підйом, − падіння),
     size_gb (наскільки змінилось вільне місце, завжди > 0)."""
     c = cfg["steps"]
-    x = used.resample(f"{c['bin_min']}min").last().dropna()
+    x = bins(used, cfg)
     if len(x) < 2:
         return []
     d = x.diff().to_numpy()
@@ -223,9 +233,25 @@ def trend(used: pd.Series, free: pd.Series, now: pd.Timestamp, steps: list[dict]
     growth_from = fast.get("growth_from") if fast else None
     if growth_from is not None:
         data = data[data.index < growth_from]
+    # Завершені нерегулярні різкі підйоми (вивантаження, швидке заповнення, що
+    # скінчилося) — як сходинка: сам підйом не беремо, точки після нього опускаємо
+    # на його розмір, а в прогнозі рівня додаємо назад (shift). Регулярні стрибки,
+    # які не видалили («сходи» бекапів), лишаються — це і є ознака зламаного видалення
+    shift, stepped = 0.0, []
+    for r in completed_rises(data, cfg):
+        f0, f1 = free.asof(r["start"]), free.asof(r["end"] + pd.Timedelta(minutes=cfg["steps"]["bin_min"] - 1))
+        r["size_gb"] = abs(float(f0 - f1)) if pd.notna(f0) and pd.notna(f1) else float("nan")
+        if matches_regular(r, regular, cfg):
+            continue
+        inside = (data.index > r["start"]) & (data.index <= r["end"] + pd.Timedelta(minutes=cfg["steps"]["bin_min"]))
+        data = data[~inside]
+        data = data.where(data.index <= r["end"], data - r["size_pp"])
+        shift += r["size_pp"]
+        stepped.append(r)
     hourly = data.resample("1h").mean().dropna()
     above = float(used.iloc[-1]) >= thr
     result = {"start": start, "excluded": excluded, "excluded_growth_from": growth_from,
+              "stepped_rises": len(stepped), "stepped_pp": shift,
               "points": len(hourly), "above_threshold_now": above}
     if len(hourly) < c["min_hours"]:
         result["status"] = "мало даних"
@@ -235,33 +261,47 @@ def trend(used: pd.Series, free: pd.Series, now: pd.Timestamp, steps: list[dict]
 
     t = np.array([hours_between(now, ts + pd.Timedelta(minutes=30)) for ts in hourly.index])
     line = Line(t, hourly.to_numpy())
+
+    def at(h):                        # прогноз рівня = пряма + сходинки, що лишилися
+        v, lo, hi = line.at(h)
+        return clip_pct((v + shift, lo + shift, hi + shift))
+
     # Рівень «зараз» для часу до порогу — менший з прямої і факту: одразу після
     # прибирання (ще не визнаного сходинкою) пряма лишається на старому рівні
-    level_now = min(line.at(0)[0], float(used.iloc[-1]))
+    level_now = min(line.at(0)[0] + shift, float(used.iloc[-1]))
     speed_h = line.b
     total_gb = total_size_gb(used, free)
     result.update({
         "status": "ok",
         "line": line,                 # сама пряма — для графіків (у predictions не пишеться)
+        "shift": shift,
         "level_now": level_now,
         "speed_pct_day": speed_h * 24,
         "speed_gb_day": speed_h * 24 * total_gb / 100 if total_gb else None,
-        "pred": {24: clip_pct(line.at(24)), 168: clip_pct(line.at(168))},
+        "pred": {24: at(24), 168: at(168)},
         "hours_to_threshold": 0.0 if above else hours_to(level_now, speed_h, thr,
                                                          c["max_hours_to_threshold"]),
     })
     return result
 
 
-def growth_start(used: pd.Series, now: pd.Timestamp, limit: float, cfg: dict) -> pd.Timestamp:
-    """Звідки почався незвичний ріст: ідемо назад від now, поки швидкість за 30 хв
-    (на 10-хв відрізках) вища за межу limit."""
-    x = used[used.index <= now].resample(f"{cfg['steps']['bin_min']}min").last().dropna()
-    rate = (x - x.shift(3)) / 0.5            # %/год за останні 30 хв
+def growth_start(used: pd.Series, now: pd.Timestamp, limit: float, cfg: dict) -> pd.Timestamp | None:
+    """Звідки почався ріст, що триває зараз: ідемо назад по 10-хв відрізках, поки
+    кожен відрізок росте швидше за половину межі limit. Повертає момент «зламу»
+    (кінець останнього рівного відрізка) або None, якщо зараз рівень не росте."""
+    bin_min = cfg["steps"]["bin_min"]
+    x = bins(used[used.index <= now], cfg)
+    if len(x) < 2:
+        return None
+    d = x.diff()
+    per_bin = 0.5 * limit * bin_min / 60          # половина межі, у п. п. за відрізок
     i = len(x) - 1
-    while i >= 3 and rate.iloc[i] > limit:
+    if not d.iloc[i] > per_bin:
+        return None
+    while i >= 1 and d.iloc[i] > per_bin:
         i -= 1
-    return x.index[i] - pd.Timedelta(minutes=30) if i < len(x) - 1 else now - pd.Timedelta(minutes=30)
+    # останнє значення рівного відрізка i записане на його (bin_min − 1)-й хвилині
+    return x.index[i] + pd.Timedelta(minutes=bin_min - 1)
 
 
 def fast_growth(used: pd.Series, now: pd.Timestamp, steps: list[dict], cfg: dict) -> dict:
@@ -279,22 +319,34 @@ def fast_growth(used: pd.Series, now: pd.Timestamp, steps: list[dict], cfg: dict
         t = np.array([hours_between(t_end, ts) for ts in seg.index])
         return Line(t, seg.to_numpy())
 
-    recent = [s["end"] + bin_ for s in steps if s["end"] + bin_ > now - w]
-    after_step = max(recent) if recent else None
-    if after_step is not None:
-        line = slope(now, after_step, c["min_points_after_step"])
-        if line is None:
-            # одразу після сходинки точок ще мало: вважаємо, що рівень не змінюється
-            v = float(used.iloc[-1])
-            line = Line(np.array([-0.1, 0.0]), np.array([v, v]))
-    else:
-        line = slope(now)
-    if line is None:
-        return {"status": "мало даних"}
     usual = [ln.b for k in range(1, c["baseline_days"] + 1)
              if (ln := slope(now - pd.Timedelta(days=k))) is not None]
     usual_p90 = float(np.percentile(usual, 90)) if usual else None
     limit = max(c["min_pct_per_h"], c["factor"] * max(usual_p90 or 0.0, 0.0))
+
+    # Пряма — лише по точках після останньої сходинки і після «зламу», з якого
+    # почався ріст: інакше рівна ділянка до росту «розбавляє» швидкість
+    recent = [s["end"] + bin_ for s in steps if s["end"] + bin_ > now - w]
+    after_step = max(recent) if recent else None
+    # «Злам» шукаємо, лише якщо рівень справді росте швидше за межу за останні 30 хв —
+    # інакше на шумному рівному диску «зламом» ставав би будь-який шум
+    last30 = used[used.index > now - pd.Timedelta(minutes=30)]
+    rate30 = (float(last30.iloc[-1] - last30.iloc[0]) / 0.5) if len(last30) > 1 else 0.0
+    knee = growth_start(used, now, limit, cfg) if rate30 > limit else None
+    fit_from = max([t for t in (after_step, knee) if t is not None and t > now - w], default=None)
+    if fit_from is not None:
+        line = slope(now, fit_from, c["min_points_after_step"])
+        if line is None:
+            # одразу після сходинки (зламу) точок ще мало
+            v = float(used.iloc[-1])
+            if after_step is not None and fit_from == after_step:
+                line = Line(np.array([-0.1, 0.0]), np.array([v, v]))    # рівень не змінюється
+            else:
+                line = slope(now)                                       # ріст щойно почався
+    else:
+        line = slope(now)
+    if line is None:
+        return {"status": "мало даних"}
     level_now = min(line.at(0)[0], float(used.iloc[-1]))
     # Незвичний — лише ріст, розподілений у часі. Якщо за останні 30 хв більшу
     # частину приросту дала одна хвилина — це стрибок (з'явився файл, бекап),
@@ -315,7 +367,9 @@ def fast_growth(used: pd.Series, now: pd.Timestamp, steps: list[dict], cfg: dict
         "limit_pct_h": limit,
         "unusual": unusual,
         "after_step_from": after_step,
-        "growth_from": growth_start(used, now, limit, cfg) if unusual else None,
+        "fit_from": fit_from,
+        # для тренду: відрізок незвичного росту (з невеликим запасом — один 10-хв відрізок)
+        "growth_from": ((knee - bin_) if knee is not None else now - w) if unusual else None,
         "above_threshold_now": above,
         "pred": {1: clip_pct(line.at(1))},
         "hours_to_threshold": 0.0 if above else hours_to(level_now, line.b, thr, 24 * 365),
@@ -327,7 +381,7 @@ def completed_rises(used: pd.Series, cfg: dict) -> list[dict]:
     ≥ step_min_pp), після яких рівень уже не росте: бекап, вивантаження, швидке
     заповнення, що скінчилося. Підйом, що триває досі, сюди не входить."""
     c = cfg["steps"]
-    x = used.resample(f"{c['bin_min']}min").last().dropna()
+    x = bins(used, cfg)
     d = x.diff().to_numpy()
     up = d >= c["step_rate_pp"]
     rises, i = [], 1
