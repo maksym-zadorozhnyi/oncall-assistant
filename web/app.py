@@ -56,11 +56,15 @@ def ts(series: list) -> list:
 # Бічна панель: сервер, момент, вікно
 # ---------------------------------------------------------------------------
 
-servers = call("list_servers")["servers"]
+listing = call("list_servers")
+if show_error(listing):
+    st.stop()
+servers = listing["servers"]
 if not servers:
     st.error("У базі немає серверів. Запустіть симулятор: python -m simulator.simulator --history 30")
     st.stop()
 names = [s["name"] for s in servers]
+main_top = st.container()          # місце в основній частині для повідомлень з бічної панелі
 
 with st.sidebar:
     st.header("Сервер")
@@ -68,6 +72,11 @@ with st.sidebar:
     server = st.selectbox("Сервер", names, index=default, label_visibility="collapsed")
     info = next(s for s in servers if s["name"] == server)
     st.caption(info["description"] or "")
+    if info["data_until"] is None:
+        # сирі дані є, а очищених (metrics_clean) ще немає — наприклад, після перегенерації
+        main_top.warning(f"Для {server} ще немає очищених даних (metrics_clean). "
+                   "Запустіть ETL: python -m core.etl, потім оновіть сторінку.")
+        st.stop()
     first = datetime.strptime(info["data_from"]["ts_local"], LOCAL_FMT)
     last = datetime.strptime(info["data_until"]["ts_local"], LOCAL_FMT)
 
