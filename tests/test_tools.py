@@ -120,11 +120,90 @@ def test_status_last_values_no_future(db):
 
 
 def test_status_stale_and_live(db):
-    """Після кінця даних сервер «замовк»; «наживо» — останні дані."""
-    r = tools.get_status("t-1", now=local(MINUTES + 20))
-    assert r["stale"] is True and r["silent_min"] == 21
+    """Після кінця даних сервер «замовк»; «наживо» — поточний час, дані — останні відомі."""
+    r = tools.get_status("t-1", now=local(MINUTES + 29))
+    assert r["stale"] is True and r["data_age_h"] == 0.5             # 30 хв
+    fresh = tools.get_status("t-1", now=local(MINUTES - 1))
+    assert fresh["stale"] is False and fresh["data_age_h"] == 0 and "stale_note" not in fresh
     live = tools.get_status("t-1")
     assert live["live"] is True and live["data_until"]["ts_local"] == local(MINUTES - 1)
+    assert live["stale"] is True                                       # тестові дані — січень 2026
+
+
+# --- Момент на 3 доби пізніше за дані: жодних нулів і жодного прогнозу «наче зараз» ---
+
+LATE = MINUTES - 1 + 3 * 1440
+
+
+def assert_stale(r: dict):
+    """Однакові поля свіжості в усіх функціях (і у відповіді, і в помилці)."""
+    assert r["stale"] is True and r["data_age_h"] == 72.0
+    assert r["data_until"]["ts_local"] == local(MINUTES - 1)
+    assert "немає свіжих даних" in r["stale_note"]
+
+
+def test_late_status_marks_last_known(db):
+    r = tools.get_status("t-1", now=local(LATE))
+    assert_stale(r)
+    assert r["checks"]["backup"]["age_h"] == 5.0                       # на час перевірки — відомо
+    assert r["checks"]["backup"]["age_h_now"] is None                  # «на зараз» — невідомо, не вигадуємо
+    assert r["metrics"]["cpu_pct"] is not None                         # останні відомі лишаються...
+    assert "останні відомі" in r["notes"][0] and "3,0 дн тому" in r["notes"][0]   # ...з позначкою
+
+
+def test_late_history_no_data(db):
+    r = tools.get_metric_history("t-1", "cpu_pct", now=local(LATE))
+    assert "немає даних" in r["error"] and f"останні — {local(MINUTES - 1)}" in r["error"]
+    assert_stale(r)
+
+
+def test_late_history_partial_window(db):
+    """Дані закінчуються всередині вікна: пропуск у кінці і примітка; числа — лише за наявні дані."""
+    r = tools.get_metric_history("t-1", "cpu_pct", now=local(MINUTES - 1 + 600))   # +10 год
+    assert r["gaps"][-1]["edge"] == "end" and r["gaps"][-1]["missing_min"] == 600
+    assert "дані закінчуються" in r["notes"][0]
+    assert r["last_point_local"] == local(MINUTES - 1)
+
+
+def test_late_folder_growth_no_zeros(db):
+    r = tools.get_folder_growth("t-1", now=local(LATE))
+    assert "немає даних про теки" in r["error"] and "folders" not in r
+    assert_stale(r)
+
+
+def test_late_folder_growth_partial(db):
+    """Вікно 24 год, дані закінчились 10 год тому: ріст — за 14 год, з приміткою."""
+    r = tools.get_folder_growth("t-1", now=local(MINUTES - 1 + 600))
+    f = r["folders"][0]
+    assert f["measured_h"] == pytest.approx(13.9, abs=0.2) and f["growth_gb"] > 0
+    assert "дані закінчуються" in r["notes"][0]
+
+
+def test_late_timeline_no_data(db):
+    r = tools.get_timeline("t-1", now=local(LATE))
+    assert "немає даних за період" in r["error"] and "items" not in r
+    assert_stale(r)
+
+
+def test_late_processes_no_snapshot(db):
+    r = tools.get_top_processes("t-1", now=local(LATE))
+    assert "немає знімка" in r["error"]
+    assert_stale(r)
+
+
+def test_late_forecast_not_for_now(db):
+    """Прогнозу «на зараз» немає; є прогноз на момент останніх даних з явною позначкою."""
+    r = tools.get_disk_forecast("t-1", now=local(LATE))
+    assert_stale(r)
+    assert "disks" not in r and "немає свіжих даних" in r["message"]
+    last = r["forecast_at_last_data"]
+    assert last["at"]["ts_local"] == local(MINUTES - 1) and "НЕ на зараз" in last["note"]
+    fresh = tools.get_disk_forecast("t-1", now=local(MINUTES - 1))
+    assert fresh["stale"] is False
+    assert last["disks"][0]["trend"] == fresh["disks"][0]["trend"]    # той самий прогноз, лише з позначкою
+    d = fresh["disks"][0]
+    assert d["to_threshold_pp"] == round(90 - d["now_pct"], 1) and d["to_threshold_gb"] == pytest.approx(
+        d["to_threshold_pp"], abs=0.2)                                   # диск 100 ГБ: 1 п. п. = 1 ГБ
 
 
 def test_history_gap_imputed_outliers(db):
@@ -234,8 +313,9 @@ def test_parameter_checks(db):
     """max_points ≥ 2, top ≥ 1, period_h > 0, limit ≥ 1 — інакше зрозуміла помилка; «50» і 50.0 — можна."""
     assert "max_points" in tools.get_metric_history("t-1", "cpu_pct", max_points=1)["error"]
     assert "max_points" in tools.get_metric_history("t-1", "cpu_pct", max_points="багато")["error"]
-    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", max_points="50")
-    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", max_points=50.0)
+    end = local(MINUTES - 1)
+    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", now=end, max_points="50")
+    assert "error" not in tools.get_metric_history("t-1", "cpu_pct", now=end, max_points=50.0)
     assert "top" in tools.get_top_processes("t-1", now=local(D + 60), top=0)["error"]
     assert "period_h" in tools.get_folder_growth("t-1", period_h=0)["error"]
     assert "period_h" in tools.get_folder_growth("t-1", period_h=-5)["error"]

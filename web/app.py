@@ -57,6 +57,7 @@ def fmt(value, unit: str = "", digits: int | None = None, sign: bool = False) ->
     """Число для показу; None — «—» (немає даних), а не падіння."""
     if value is None:
         return "—"
+    value = 0.0 if value == 0 else value                 # -0.0 == 0, тож «-0.0» не буде
     if digits is not None:
         text = f"{value:+.{digits}f}" if sign else f"{value:.{digits}f}"
     else:
@@ -114,7 +115,7 @@ with st.sidebar:
         st.session_state.live = False
 
     st.subheader("Момент (місцевий час, UTC+2)")
-    live = st.toggle("Наживо (останні дані)", key="live")
+    live = st.toggle("Наживо (поточний час)", key="live")
     st.date_input("Дата", key="m_date", min_value=first.date() - timedelta(days=365),
                   max_value=last.date() + timedelta(days=365), disabled=live, format="DD.MM.YYYY")
     st.time_input("Час", key="m_time", step=timedelta(minutes=5), disabled=live)
@@ -131,10 +132,6 @@ with st.sidebar:
 
 now = None if live else datetime.combine(st.session_state.m_date, st.session_state.m_time).strftime(LOCAL_FMT)
 
-# Початок вікна графіків (місцевий час) — від моменту «зараз»
-now_dt = last if now is None else datetime.strptime(now, LOCAL_FMT)
-win_start = (now_dt - timedelta(hours=window_h)).strftime(LOCAL_FMT)
-
 st.title(f"{server}")
 
 # ---------------------------------------------------------------------------
@@ -144,13 +141,33 @@ st.title(f"{server}")
 status = call("get_status", server=server, now=now)
 if show_error(status):
     st.stop()
+
+# Момент «зараз» (у живому режимі — поточний час) і початок вікна графіків, місцевий час
+now_dt = datetime.strptime(status["now"]["ts_local"], LOCAL_FMT)
+win_start = (now_dt - timedelta(hours=window_h)).strftime(LOCAL_FMT)
+
 st.caption(f"Момент: {status['now']['ts_local']} (UTC {status['now']['ts_utc']})"
            f"{' — наживо' if status['live'] else ''}. Дані до {status['data_until']['ts_local']}.")
 if status["stale"]:
-    st.error(f"Сервер замовк: немає нових даних {status['silent_min']:.0f} хв "
-             f"(останні — {status['data_until']['ts_local']}).")
+    st.error(f"Сервер замовк: немає нових даних {tools.age_text(status['data_age_h'])} "
+             f"(останні — {status['data_until']['ts_local']}). Усі блоки нижче — останні відомі дані.")
+
+
+def stale_mark(result: dict) -> None:
+    """Підпис блоку, коли свіжих даних немає (stale): значення — останні відомі, а не поточні."""
+    if result.get("stale"):
+        st.caption(f"⚠ останні відомі дані на {result['data_until']['ts_local']} "
+                   f"({tools.age_text(result['data_age_h'])} тому)")
+
+
+def show_notes(result: dict) -> None:
+    """Лише ситуаційні примітки (notes). Постійні (about) — лише в JSON для LLM."""
+    for note in result.get("notes", []):
+        st.caption(note)
+
 
 st.subheader("A. Стан")
+stale_mark(status)
 m = status["metrics"]
 cards = [("CPU", fmt(m.get("cpu_pct"), " %")), ("RAM", fmt(m.get("ram_pct"), " %"))]
 cards += [(f"Диск {d['drive']}", fmt(d["used_pct"], " %"),
@@ -189,28 +206,39 @@ with right:
     for name, c in status["checks"].items():
         value = {k: v for k, v in c.items() if k not in ("ok", "details", "checked_local")}
         rows.append({"перевірка": name, "ok": "так" if c["ok"] else "НІ",
-                     "значення": ", ".join(f"{k} = {v}" for k, v in value.items()),
+                     "значення": ", ".join(f"{k} = {fmt(v)}" for k, v in value.items()),
                      "деталі": c["details"], "перевірено": c["checked_local"]})
     chk = pd.DataFrame(rows)
     if not chk.empty:
         st.dataframe(red_rows(chk, chk["ok"] != "так"), hide_index=True)
-for note in status["notes"]:
-    st.caption(note)
+show_notes(status)
 
 # ---------------------------------------------------------------------------
 # B. Графіки
 # ---------------------------------------------------------------------------
 
 st.subheader(f"B. Графіки за {win_label}")
+stale_mark(status)
+
+
+def mark_now(fig) -> None:
+    """Вертикаль «зараз» — щоб період без даних між останньою точкою і «зараз» було видно."""
+    fig.add_shape(type="line", x0=now_dt, x1=now_dt, y0=0, y1=1, yref="paper",
+                  line=dict(color="#888888", width=1, dash="dot"))
+    fig.add_annotation(x=now_dt, y=1, yref="paper", text="зараз", showarrow=False, yanchor="bottom",
+                       xanchor="right")
 
 
 def metric_chart(metric: str, title: str, height: int = 260):
-    """Лінія метрики; заповнені точки — сірі кружечки, викиди — червоні."""
+    """Лінія метрики; заповнені точки — сірі кружечки, викиди — червоні.
+    Вісь X — від початку вікна до моменту «зараз», навіть якщо дані закінчились раніше."""
     r = call("get_metric_history", server=server, metric=metric, start=win_start, now=now,
              max_points=DASH_POINTS)
     if show_error(r):
         return
     fig = go.Figure()
+    fig.update_xaxes(range=[datetime.strptime(win_start, LOCAL_FMT), now_dt])
+    mark_now(fig)
     fig.add_scatter(x=ts(r["series"]), y=[p[1] for p in r["series"]], mode="lines", name=title,
                     line=dict(width=2, color="#1f77b4"))
     if r["imputed_points"]:
@@ -220,12 +248,14 @@ def metric_chart(metric: str, title: str, height: int = 260):
         fig.add_scatter(x=ts(r["outlier_points"]), y=[p[1] for p in r["outlier_points"]], mode="markers",
                         name="викид (ETL)", marker=dict(size=9, color="#d62728"))
     step = f", середнє по {r['step_min']} хв" if r["step_min"] > 1 else ""
-    fig.update_layout(title=f"{title}, {r['unit']}{step} — макс {r['max']['value']} о {r['max']['ts_local'][11:]}, "
-                            f"сер. {r['mean']}; заповнено {r['imputed']}, викидів {r['outliers']}, "
-                            f"пропусків {r['gaps_total']}",
+    fig.update_layout(title=f"{title}, {r['unit']}{step}",
                       height=height, margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified",
                       legend=dict(orientation="h", y=-0.15), title_font_size=13)
     st.plotly_chart(fig)
+    # статистика — під графіком (у заголовку довгий рядок обрізався)
+    st.caption(f"макс {fmt(r['max']['value'])} о {r['max']['ts_local']}, сер. {fmt(r['mean'])}; "
+               f"заповнено {r['imputed']}, викидів {r['outliers']}, пропусків {r['gaps_total']}")
+    show_notes(r)
 
 
 c1, c2 = st.columns(2)
@@ -264,36 +294,59 @@ fc = call("get_disk_forecast", server=server, drive=drive, now=now, with_line=Tr
 disk_start = (now_dt - timedelta(days=DISK_HISTORY_DAYS)).strftime(LOCAL_FMT)
 hist = call("get_metric_history", server=server, metric=f"disk_used_pct:{drive}", start=disk_start,
             now=now, max_points=DASH_POINTS)
-disk_ok = not show_error(fc) and not show_error(hist)
-if disk_ok and "error" in fc["disks"][0]:
-    # прогноз для цього диска не порахувався (наприклад, замало даних) — плашка, а не KeyError
-    st.warning(f"Прогноз для {drive}: {fc['disks'][0]['error']}")
-    disk_ok = False
-if disk_ok:
-    d = fc["disks"][0]
-    thr = fc["threshold_pct"]
-    fig = go.Figure()
+stale_mark(fc)
+full_scale = st.toggle("Вісь 0–100 %", key="disk_full_scale")
+d, label = None, ""
+if not show_error(fc):
+    if "disks" in fc:
+        d = fc["disks"][0]
+    else:
+        # немає свіжих даних: прогнозу на «зараз» немає — лише на момент останніх даних, з позначкою
+        st.warning(fc["message"])
+        d = fc["forecast_at_last_data"]["disks"][0]
+        label = f" (на момент останніх даних, {fc['forecast_at_last_data']['at']['ts_local']})"
+        st.caption(f"⚠ {fc['forecast_at_last_data']['note']}")
+    if "error" in d:
+        # прогноз для цього диска не порахувався (наприклад, замало даних) — плашка, а не KeyError
+        st.warning(f"Прогноз для {drive}: {d['error']}")
+        d = None
+thr = fc.get("threshold_pct", 90)
+
+# Графік: історія за 14 днів до «зараз» + пряма тренду; вісь X — щонайменше до «зараз»
+fig = go.Figure()
+ys = []
+if not show_error(hist):
     fig.add_scatter(x=ts(hist["series"]), y=[p[1] for p in hist["series"]], mode="lines", name="зайнято, %",
                     line=dict(width=2, color="#1f77b4"))
-    if d.get("trend_line"):
-        tl = d["trend_line"]
-        x = ts(tl)
-        fig.add_scatter(x=x + x[::-1], y=[p[3] for p in tl] + [p[2] for p in tl][::-1], fill="toself",
-                        fillcolor="rgba(255,127,14,0.15)", line=dict(width=0), name="інтервал 10–90 %",
-                        hoverinfo="skip")
-        fig.add_scatter(x=x, y=[p[1] for p in tl], mode="lines", name="тренд",
-                        line=dict(width=2, color="#ff7f0e", dash="dash"))
-    fig.add_hline(y=thr, line=dict(color="#d62728", width=1, dash="dot"),
-                  annotation_text=f"{thr} %", annotation_position="top left")
-    moment = pd.Timestamp(fc["now"]["ts_local"])
-    fig.add_shape(type="line", x0=moment, x1=moment, y0=0, y1=1, yref="paper",
-                  line=dict(color="#555555", width=1))
-    fig.add_annotation(x=moment, y=1, yref="paper", text="зараз", showarrow=False, yanchor="bottom")
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
-                      yaxis=dict(range=[max(0, min(p[1] for p in hist["series"]) - 10), 101]),
-                      legend=dict(orientation="h", y=-0.12))
-    st.plotly_chart(fig)
+    ys += [p[1] for p in hist["series"]]
+if d and d.get("trend_line"):
+    tl = d["trend_line"]
+    x = ts(tl)
+    fig.add_scatter(x=x + x[::-1], y=[p[3] for p in tl] + [p[2] for p in tl][::-1], fill="toself",
+                    fillcolor="rgba(255,127,14,0.15)", line=dict(width=0), name="інтервал 10–90 %",
+                    hoverinfo="skip")
+    fig.add_scatter(x=x, y=[p[1] for p in tl], mode="lines", name="тренд" + label,
+                    line=dict(width=2, color="#ff7f0e", dash="dash"))
+    ys += [p[1] for p in tl]
+fig.add_hline(y=thr, line=dict(color="#d62728", width=1, dash="dot"),
+              annotation_text=f"{thr} %", annotation_position="top left")
+mark_now(fig)
+x_end = max([now_dt] + (ts(d["trend_line"])[-1:] if d and d.get("trend_line") else []))
+fig.update_xaxes(range=[datetime.strptime(disk_start, LOCAL_FMT), x_end])
+if full_scale or not ys:
+    y_range = [0, 101]
+else:
+    # вісь Y — за даними з запасом: на «тихому» диску видно й невеликі зміни
+    lo, hi = min(ys), max(ys)
+    pad = max(2.0, (hi - lo) * 0.15)
+    y_range = [max(0, lo - pad), min(101, hi + pad)]
+fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                  yaxis=dict(range=y_range), legend=dict(orientation="h", y=-0.12))
+st.plotly_chart(fig)
+if "error" not in hist:
+    show_notes(hist)
 
+if d:
     tr, fg, jp = d["trend"], d["fast_growth"], d["jump"]
 
     def until(h):
@@ -303,7 +356,13 @@ if disk_ok:
             return f"вже вище {thr} %"
         return f"до {thr} % — {h:.0f} год" if h < 72 else f"до {thr} % — {h / 24:.1f} дн"
 
-    st.markdown(f"**Зараз:** {fmt(d['now_pct'], ' %')}, вільно {fmt(d['now_free_gb'], ' ГБ')}")
+    if d["to_threshold_pp"] is not None and d["to_threshold_pp"] <= 0:
+        distance = f"вже вище {thr} %"
+    else:
+        distance = (f"до {thr} % лишилось {fmt(d['to_threshold_pp'])} п. п. "
+                    f"({fmt(d['to_threshold_gb'], ' ГБ')})")
+    st.markdown(f"**{'Останнє відоме' if label else 'Зараз'}{label}:** {fmt(d['now_pct'], ' %')}, "
+                f"вільно {fmt(d['now_free_gb'], ' ГБ')}; {distance}")
     if tr["status"] == "ok":
         st.markdown(f"**1. Тренд** (з {tr['from_local']}): {fmt(tr['pct_per_day'], sign=True)} %/добу "
                     f"({fmt(tr['gb_per_day'])} ГБ/добу); +24 год — {fmt(tr['in_24h']['pct'], ' %')} "
@@ -323,14 +382,14 @@ if disk_ok:
                     f"{fmt(jp['free_then_gb'], ' ГБ', 0)} — **{jp['text']}**")
     else:
         st.markdown(f"**3.** {jp['text']}")
-    for note in d["notes"]:
-        st.caption(note)
+    show_notes(d)
 
 # ---------------------------------------------------------------------------
 # D. Процеси
 # ---------------------------------------------------------------------------
 
 st.subheader("D. Процеси")
+stale_mark(status)
 c1, c2 = st.columns(2)
 for col, by, title in ((c1, "cpu", "Топ за CPU"), (c2, "ram", "Топ за RAM")):
     with col:
@@ -350,20 +409,20 @@ for col, by, title in ((c1, "cpu", "Топ за CPU"), (c2, "ram", "Топ за 
 
 st.subheader("E. Що росте за 24 год")
 g = call("get_folder_growth", server=server, now=now)
+stale_mark(g)
 if not show_error(g):
-    labels = [f["path"] for f in g["folders"]] + [f"інше ({d['drive']})" for d in g["disks"]]
-    values = [f["growth_gb"] for f in g["folders"]] + [d["other_gb"] for d in g["disks"]]
+    labels = [f["path"] for f in g["folders"]] + [f"інше ({dk['drive']})" for dk in g["disks"]]
+    values = [f["growth_gb"] for f in g["folders"]] + [dk["other_gb"] for dk in g["disks"]]
     # None (немає даних на початку періоду) — стовпчика немає, підпис «—»
     fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", text=[fmt(v, " ГБ", 2, sign=True) for v in values],
                            marker_color=["#1f77b4"] * len(g["folders"]) + ["#aaaaaa"] * len(g["disks"])))
     fig.update_layout(height=60 + 35 * len(labels), margin=dict(l=10, r=10, t=10, b=10),
                       yaxis=dict(autorange="reversed"), xaxis_title="ріст, ГБ")
     st.plotly_chart(fig)
-    st.caption("; ".join(f"{d['drive']}: диск {fmt(d['growth_gb'], ' ГБ', sign=True)}, "
-                         f"теки {fmt(d['folders_gb'], ' ГБ', sign=True)}, "
-                         f"інше {fmt(d['other_gb'], ' ГБ', sign=True)}" for d in g["disks"]))
-    for note in g["notes"]:
-        st.caption(note)
+    st.caption("; ".join(f"{dk['drive']}: диск {fmt(dk['growth_gb'], ' ГБ', sign=True)}, "
+                         f"теки {fmt(dk['folders_gb'], ' ГБ', sign=True)}, "
+                         f"інше {fmt(dk['other_gb'], ' ГБ', sign=True)}" for dk in g["disks"]))
+    show_notes(g)
 
 # ---------------------------------------------------------------------------
 # F. Хронологія
@@ -371,6 +430,7 @@ if not show_error(g):
 
 st.subheader(f"F. Хронологія за {win_label}")
 tl = call("get_timeline", server=server, start=win_start, now=now, limit=500)
+stale_mark(tl)
 if not show_error(tl):
     types = st.multiselect("Типи", ["event", "service", "check", "alert"],
                            default=["event", "service", "check", "alert"])
@@ -380,15 +440,14 @@ if not show_error(tl):
         df = df.where(df.notna(), "")
         st.dataframe(df.rename(columns={"ts_local": "час", "type": "тип", "source": "джерело", "code": "код",
                                         "level": "рівень", "text": "текст"}), hide_index=True)
-    else:
+    elif not tl["notes"]:
         st.caption("за цей період нічого не сталося")
     type_names = {"event": "події журналу", "service": "зміни служб", "check": "зміни перевірок",
                   "alert": "алерти"}
     by_type = ", ".join(f"{type_names[k]} — {v}" for k, v in tl["counts"].items())
     noise = ", ".join(f"{code} × {n}" for code, n in tl["noise"].items()) or "немає"
     st.caption(f"За типами: {by_type}. Шумові події (лише кількість): {noise}.")
-    for note in tl.get("notes", []):
-        st.caption(note)
+    show_notes(tl)
 
 # ---------------------------------------------------------------------------
 # G. Що отримає LLM

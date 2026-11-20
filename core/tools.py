@@ -37,6 +37,7 @@ TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"  # формат часу в базі
 SHOW_FORMAT = "%Y-%m-%d %H:%M"  # формат часу у відповіді
 STALE_MIN = 10                  # сервер «замовк», якщо даних немає довше
 SNAPSHOT_MAX_MIN = 10           # знімок процесів — не давніший за стільки хвилин
+BACKUP_CHECK_MAX_H = 2          # перевірка бекапу щогодинна; давніша — вік «на зараз» невідомий
 DEFAULT_WINDOW_H = 24           # вікно за замовчуванням для історії і хронології
 NOISE_EVENTS = {1014, 37}       # шумові події: у хронології лише кількість
 INFO_EVENTS = {7036, 18264}     # події рівня Information, які все одно показуємо
@@ -203,13 +204,14 @@ def data_range(conn, server_id: int) -> tuple[str | None, str | None]:
 
 def resolve_now(conn, server_row, now) -> tuple[pd.Timestamp, bool]:
     """Момент «зараз» у UTC і чи це живий режим.
-    Живий режим (now=None) — останні дані сервера. Момент раніше за перші дані — помилка."""
+    Живий режим (now=None) — справжній поточний час: якщо сервер давно не надсилав даних,
+    це видно (stale), а не підміняється останніми даними. Момент раніше за перші дані — помилка."""
     first, last = data_range(conn, server_row["id"])
     if last is None:
         raise ToolError(f"для сервера {server_row['name']} ще немає даних")
     t = to_utc(now)
     if t is None:
-        return parse_db(last), True
+        return pd.Timestamp.now(tz="UTC").floor("min"), True
     if t < parse_db(first):
         raise ToolError(f"немає даних до {loc(t)} (місц.); перші дані {server_row['name']} — "
                         f"{loc(first)}", data_from=pair(first))
@@ -220,6 +222,29 @@ def last_ts_before(conn, server_id: int, now: pd.Timestamp) -> str | None:
     r = conn.execute("SELECT MAX(ts) FROM metrics_clean WHERE server_id = ? AND metric = 'cpu_pct' "
                      "AND ts < ?", (server_id, cutoff(now))).fetchone()
     return r[0]
+
+
+def age_text(hours: float) -> str:
+    """Скільки часу тому словами: «25 хв», «7 год», «2,9 дн»."""
+    if hours < 1:
+        return f"{hours * 60:.0f} хв"
+    if hours < 48:
+        return f"{hours:.0f} год"
+    return f"{hours / 24:.1f} дн".replace(".", ",")
+
+
+def freshness(conn, server_id: int, t: pd.Timestamp) -> dict:
+    """Одне правило «дані застаріли» для всіх функцій: data_until (останні дані сервера
+    не пізніше now), data_age_h (скільки годин тому), stale (старші за STALE_MIN хвилин),
+    і для stale — stale_note словами."""
+    until = last_ts_before(conn, server_id, t)
+    until_t = parse_db(until)
+    age_h = max((t - until_t).total_seconds() / 3600, 0.0)
+    out = {"data_until": pair(until_t), "data_age_h": num(age_h, 1), "stale": age_h * 60 > STALE_MIN}
+    if out["stale"]:
+        out["stale_note"] = (f"немає свіжих даних: останні дані на {loc(until_t)}, "
+                             f"{age_text(age_h)} тому")
+    return out
 
 
 def metric_names(conn, server_id: int) -> list[str]:
@@ -246,6 +271,7 @@ def list_servers() -> dict:
     data_from і data_until (час перших і останніх даних, UTC і місцевий).
     """
     out = []
+    clock = pd.Timestamp.now(tz="UTC")
     with connect() as conn:
         for s in conn.execute("SELECT * FROM servers ORDER BY id").fetchall():
             first, last = data_range(conn, s["id"])
@@ -253,12 +279,16 @@ def list_servers() -> dict:
                 "SELECT DISTINCT name, kind FROM service_status WHERE server_id = ? ORDER BY kind DESC, name",
                 (s["id"],))]
             inv = inventory(s)
-            out.append({"name": s["name"], "kind": s["kind"], "description": s["description"],
-                        "disks": disks_of(metric_names(conn, s["id"])),
-                        "services": services,
-                        "sites": [{"site": x.get("name"), "app_pool": x.get("app_pool")}
-                                  for x in inv.get("sites", [])],
-                        "data_from": pair(first), "data_until": pair(last)})
+            item = {"name": s["name"], "kind": s["kind"], "description": s["description"],
+                    "disks": disks_of(metric_names(conn, s["id"])),
+                    "services": services,
+                    "sites": [{"site": x.get("name"), "app_pool": x.get("app_pool")}
+                              for x in inv.get("sites", [])],
+                    "data_from": pair(first), "data_until": pair(last)}
+            if last is not None:      # свіжість — відносно справжнього поточного часу
+                age_h = max((clock - parse_db(last)).total_seconds() / 3600, 0.0)
+                item.update({"data_age_h": num(age_h, 1), "stale": age_h * 60 > STALE_MIN})
+            out.append(item)
     return {"servers": out}
 
 
@@ -300,19 +330,21 @@ def check_states(conn, server_id: int, now: pd.Timestamp) -> dict:
             out[t] = {"ok": bool(r["ok"]), CHECK_VALUE[t]: num(r["value"], 1),
                       "details": localize_text(r["details"]), "checked_local": loc(r["ts"])}
             if t == "backup" and r["value"] is not None:
-                # перевірка щогодинна: age_h — вік на час перевірки, age_h_now — на момент now
+                # перевірка щогодинна: age_h — вік на час перевірки, age_h_now — на момент now.
+                # Якщо перевірка давня (даних немає), age_h_now не рахуємо: ми не знаємо,
+                # чи був бекап після неї, — інакше це було б вигадане число
                 passed_h = (now - parse_db(r["ts"])).total_seconds() / 3600
-                out[t]["age_h_now"] = num(r["value"] + max(passed_h, 0), 1)
+                if passed_h <= BACKUP_CHECK_MAX_H:
+                    out[t]["age_h_now"] = num(r["value"] + max(passed_h, 0), 1)
+                else:
+                    out[t]["age_h_now"] = None
     return out
 
 
 def server_status(conn, s, now) -> dict:
     t, live = resolve_now(conn, s, now)
+    fresh = freshness(conn, s["id"], t)
     until = last_ts_before(conn, s["id"], t)
-    until_t = parse_db(until)
-    # Живий режим: «замовк» відносно справжнього годинника; історія — відносно now
-    ref = pd.Timestamp.now(tz="UTC") if live else t
-    silent_min = (ref - until_t).total_seconds() / 60
     # Кожна метрика — останнє значення не пізніше now (а не лише в хвилину data_until:
     # якщо якоїсь метрики в цю хвилину немає, беремо її попереднє значення)
     values, older = {}, []
@@ -335,19 +367,21 @@ def server_status(conn, s, now) -> dict:
                       "total_gb": num(tot["total_gb"], 1) if tot else None})
     services = service_states(conn, s["id"], t)
     checks = check_states(conn, s["id"], t)
-    notes = older
+    notes = older                       # ситуаційні примітки (показує й дашборд)
+    if fresh["stale"]:
+        notes.insert(0, f"усі значення — останні відомі на {fresh['data_until']['ts_local']}, "
+                        f"{age_text(fresh['data_age_h'])} тому, а не поточні")
+    about = []                          # постійні примітки про сервер (лише для LLM)
     missing = [c for c in CHECK_VALUE if c not in checks]
     if missing:
-        notes.append(f"перевірок {', '.join(missing)} на цьому сервері немає")
+        about.append(f"перевірок {', '.join(missing)} на цьому сервері немає")
     inv = inventory(s)
-    return {"server": s["name"], "now": pair(t), "live": live,
-            "data_until": pair(until_t), "stale": silent_min > STALE_MIN,
-            "silent_min": num(silent_min, 0) if silent_min > STALE_MIN else 0,
+    return {"server": s["name"], "now": pair(t), "live": live, **fresh,
             "metrics": metrics, "disks": disks, "services": services,
             "not_running": [x["name"] for x in services if x["status"] != "running"],
             "checks": checks,
             "sites": [{"site": x.get("name"), "app_pool": x.get("app_pool")} for x in inv.get("sites", [])],
-            "notes": notes}
+            "notes": notes, "about": about}
 
 
 @tool
@@ -357,12 +391,15 @@ def get_status(server: str | None = None, now: str | None = None) -> dict:
     Коли викликати: «Що з серверами?», «Що з sim-1?», «Чи працює ApiPool?»,
     «Коли закінчується сертифікат?», «Коли був останній бекап?».
     Параметри: server — назва (None — усі сервери); now — момент «зараз»,
-    місцевий час «2026-11-10 08:00» (None — останні дані).
-    Повертає: data_until (час останніх даних), stale (true — даних немає довше
-    10 хв), metrics (останні CPU, RAM, I/O, мережа, сайт), disks (used_pct,
+    місцевий час «2026-11-10 08:00» (None — поточний час).
+    Повертає: data_until (час останніх даних), data_age_h (скільки годин тому),
+    stale (true — даних немає довше 10 хв: тоді всі значення — останні відомі, а не
+    поточні, див. stale_note), metrics (CPU, RAM, I/O, мережа, сайт), disks (used_pct,
     free_gb, total_gb), services (стан і відколи), not_running, checks (http:
-    response_ms; cert: days_left; backup: age_h; sql_port: response_ms; ok і час
-    перевірки), sites (сайт -> пул IIS).
+    response_ms; cert: days_left; backup: age_h на час перевірки і age_h_now на now;
+    sql_port: response_ms; ok і час перевірки), sites (сайт -> пул IIS),
+    notes (ситуаційні примітки), about (постійні факти про сервер).
+    Так само в усіх інструментах: data_until, data_age_h, stale, stale_note.
     """
     with connect() as conn:
         if server:
@@ -418,7 +455,7 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
     Параметри: metric — cpu_pct, ram_pct, disk_read_mbs, disk_write_mbs, net_in_mbs,
     net_out_mbs, app_response_ms, app_error_pct, disk_used_pct:<диск>, disk_free_gb:<диск>
     (наприклад disk_used_pct:E:); start, end — місцевий час (за замовчуванням 24 год до now);
-    now — момент «зараз» (None — останні дані); max_points — скільки точок у series.
+    now — момент «зараз» (None — поточний час); max_points — скільки точок у series.
     Повертає: first, last, change, mean, min і max (з часом), points (скільки хвилин є),
     imputed (заповнено інтерполяцією), outliers (позначено викидами) і outlier_points,
     gaps (пропуски даних від–до), series — проріджений ряд [місцевий час, значення]
@@ -428,6 +465,7 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
     with connect() as conn:
         s = find_server(conn, server)
         t_now, _ = resolve_now(conn, s, now)
+        fresh = freshness(conn, s["id"], t_now)
         names = metric_names(conn, s["id"])
         if metric not in names:
             raise ToolError(f"невідома метрика «{metric}» для {server}", known_metrics=names)
@@ -439,8 +477,8 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
         if df.empty:
             near = conn.execute("SELECT MAX(ts) FROM metrics_clean WHERE server_id = ? AND metric = ? AND ts <= ?",
                                 (s["id"], metric, db_ts(start_t))).fetchone()[0]
-            raise ToolError(f"немає даних {metric} за період {loc(start_t)} – {loc(end_t)} (місц.)",
-                            nearest_data_local=loc(near))
+            raise ToolError(f"немає даних {metric} за період {loc(start_t)} – {loc(end_t)} (місц.); "
+                            f"останні — {loc(near) or 'немає'}", nearest_data_local=loc(near), **fresh)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts")
     v = df["value"]
@@ -454,9 +492,13 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
     diffs = v.index.to_series().diff()
     for ts, d in diffs[diffs > minute].items():
         gaps.append({"from_local": loc(ts - d), "to_local": loc(ts), "missing_min": int(d / minute) - 1})
+    notes = []
     if v.index[-1] < end_t:
         gaps.append({"from_local": loc(v.index[-1]), "to_local": loc(end_t),
                      "missing_min": int((end_t - v.index[-1]) / minute), "edge": "end"})
+        if (end_t - v.index[-1]) / minute > STALE_MIN:
+            notes.append(f"дані закінчуються о {loc(v.index[-1])}; до кінця періоду ({loc(end_t)}) "
+                         f"даних немає — усі числа лише за наявні дані")
     median = float(v.median())
     mark_limit = max(10, max_points // 5)
     series, step_min = thin(v, max_points)
@@ -473,7 +515,7 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
             "gaps": gaps[:10], "gaps_total": len(gaps),
             "step_min": step_min,
             "series": [[loc(ts), num(x)] for ts, x in series.items()],
-            "data_until": pair(v.index[-1])}
+            "last_point_local": loc(v.index[-1]), **fresh, "notes": notes}
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +527,7 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
     """Процеси з найбільшим навантаженням у знімку, найближчому до моменту now.
 
     Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «Що вантажило о 14:07?».
-    Параметри: now — момент, місцевий час (None — останні дані); by — "cpu" або "ram";
+    Параметри: now — момент, місцевий час (None — поточний час); by — "cpu" або "ram";
     top — скільки процесів. Знімок береться не пізніше now і не давніший за 10 хв;
     інакше — помилка «немає знімка».
     Повертає: snapshot_local (час знімка), cpu_server і ram_server_pct (CPU і RAM сервера
@@ -499,14 +541,15 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
     with connect() as conn:
         s = find_server(conn, server)
         t, _ = resolve_now(conn, s, now)
+        fresh = freshness(conn, s["id"], t)
         lo = db_ts(t - pd.Timedelta(minutes=SNAPSHOT_MAX_MIN))
         snap = conn.execute("SELECT MAX(ts) FROM process_snapshots WHERE server_id = ? AND ts < ? AND ts >= ?",
                             (s["id"], cutoff(t), lo)).fetchone()[0]
         if snap is None:
             near = conn.execute("SELECT MAX(ts) FROM process_snapshots WHERE server_id = ? AND ts < ?",
                                 (s["id"], cutoff(t))).fetchone()[0]
-            raise ToolError(f"немає знімка процесів за {SNAPSHOT_MAX_MIN} хв до {loc(t)} (місц.)",
-                            nearest_snapshot_local=loc(near))
+            raise ToolError(f"немає знімка процесів за {SNAPSHOT_MAX_MIN} хв до {loc(t)} (місц.); "
+                            f"останній — {loc(near) or 'немає'}", nearest_snapshot_local=loc(near), **fresh)
         order = "cpu_pct" if by == "cpu" else "ram_mb"
         rows = conn.execute(f"SELECT name, pid, cpu_pct, ram_mb, app_pool FROM process_snapshots "
                             f"WHERE server_id = ? AND ts = ? ORDER BY {order} DESC LIMIT ?",
@@ -525,7 +568,7 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
              for r in rows]
     return {"server": server, "snapshot_local": loc(snap), "by": by,
             "cpu_server": num(m.get("cpu_pct"), 1), "ram_server_pct": num(m.get("ram_pct"), 1),
-            "processes": procs}
+            "processes": procs, **fresh}
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +595,7 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
 
     Коли викликати: «Що там росте?», «Яка тека виросла за добу?», «Чим зайнятий диск D:?».
     Параметри: period_h — період у годинах до now (за замовчуванням 24); drive — лише
-    один диск, наприклад "E:"; now — момент «зараз» (None — останні дані).
+    один диск, наприклад "E:"; now — момент «зараз» (None — поточний час).
     Повертає: folders — по кожній теці size_start_gb, size_now_gb, growth_gb,
     growth_gb_per_day (від найбільшого росту); disks — по кожному диску growth_gb (ріст
     зайнятого місця зі зміни вільного), folders_gb (сума тек) і other_gb (росте щось
@@ -562,9 +605,23 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
     with connect() as conn:
         s = find_server(conn, server)
         t, _ = resolve_now(conn, s, now)
+        fresh = freshness(conn, s["id"], t)
         t0 = t - pd.Timedelta(hours=period_h)
-        now_sizes, start_sizes = sizes_at(conn, s["id"], t), sizes_at(conn, s["id"], t0)
-        notes = ["агент знає лише розмір відстежуваних тек, а не окремі файли"]
+        # «Зараз» для кожної теки — останній знімок усередині вікна (t0, t]. Знімок давніший
+        # за t0 не годиться: інакше обидва знімки були б однакові і ріст «0» вводив би в оману
+        now_sizes = {p: v for p, v in sizes_at(conn, s["id"], t).items() if parse_db(v[0]) > t0}
+        if not now_sizes:
+            last = conn.execute("SELECT MAX(ts) FROM folder_sizes WHERE server_id = ? AND ts < ?",
+                                (s["id"], cutoff(t))).fetchone()[0]
+            raise ToolError(f"немає даних про теки за період {loc(t0)} – {loc(t)} (місц.); "
+                            f"останні — {loc(last) or 'немає'}", **fresh)
+        start_sizes = sizes_at(conn, s["id"], t0)
+        notes = []                       # ситуаційні примітки
+        about = ["агент знає лише розмір відстежуваних тек, а не окремі файли"]
+        last_snap = max(parse_db(v[0]) for v in now_sizes.values())
+        if (t - last_snap).total_seconds() / 60 > STALE_MIN:
+            notes.append(f"дані закінчуються о {loc(last_snap)}: ріст пораховано до цього часу, "
+                         f"а не до {loc(t)}")
         folders = []
         for path, (ts1, size1) in now_sizes.items():
             d = path[:2].upper()
@@ -581,7 +638,7 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
             hours = (parse_db(ts1) - parse_db(ts0)).total_seconds() / 3600
             growth = size1 - size0
             folders.append({"path": path, "drive": d, "size_start_gb": num(size0), "size_now_gb": num(size1),
-                            "growth_gb": num(growth),
+                            "growth_gb": num(growth), "measured_h": num(hours, 1),
                             "growth_gb_per_day": num(growth / hours * 24) if hours > 0 else None})
         folders.sort(key=lambda x: x["growth_gb"] or 0, reverse=True)
         disks = []
@@ -589,13 +646,15 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
                         set(disks_of(metric_names(conn, s["id"])))):
             if drive and d != drive.upper():
                 continue
+            # ріст диска — лише якщо метрики диска є всередині вікна (інакше f0 = f1 і «0»)
+            metrics_in_window = parse_db(last_ts_before(conn, s["id"], t)) > t0
             f0, f1 = free_at(conn, s["id"], d, t0), free_at(conn, s["id"], d, t)
-            growth = (f0 - f1) if f0 is not None and f1 is not None else None
+            growth = (f0 - f1) if f0 is not None and f1 is not None and metrics_in_window else None
             in_folders = sum(f["growth_gb"] or 0 for f in folders if f["drive"] == d)
             disks.append({"drive": d, "growth_gb": num(growth), "folders_gb": num(in_folders),
                           "other_gb": num(growth - in_folders) if growth is not None else None})
     return {"server": server, "from_local": loc(t0), "to_local": loc(t),
-            "folders": folders, "disks": disks, "notes": notes}
+            "folders": folders, "disks": disks, **fresh, "notes": notes, "about": about}
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +708,12 @@ def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bo
                  "level_after_pct": num(j["level_after_pct"], 1), "text": j["text"]}
     else:
         j_out = {"found": False, "text": j["text"]}
-    out = {"drive": drive, "now_pct": num(r["now_pct"], 1), "now_free_gb": num(r["now_free_gb"], 1),
+    # Відстань до порогу: у п. п. і в ГБ (розмір диска = вільно / (1 − зайнято))
+    thr, used, free = cfg["threshold_pct"], r["now_pct"], r["now_free_gb"]
+    total = free / (1 - used / 100) if used < 99.9 else None
+    out = {"drive": drive, "now_pct": num(used, 1), "now_free_gb": num(free, 1),
+           "to_threshold_pp": num(thr - used, 1),
+           "to_threshold_gb": num((thr - used) / 100 * total, 1) if total else None,
            "trend": trend_out, "fast_growth": fg_out, "jump": j_out, "notes": notes}
     if with_line and tr.get("status") == "ok":
         out["trend_line"] = trend_line(tr, now)
@@ -663,7 +727,7 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
 
     Коли викликати: «Коли заповниться E:?», «Чи поміститься бекап?», «На скільки вистачить диска?».
     Параметри: drive — диск, наприклад "E:" (None — усі диски); now — момент «зараз»
-    (None — останні дані); with_line — додати точки прямої тренду для графіка.
+    (None — поточний час); with_line — додати точки прямої тренду для графіка.
     Повертає по кожному диску:
     - trend — повільний ріст від останнього прибирання: pct_per_day, gb_per_day,
       рівень in_24h і in_7d з інтервалом 10–90 % (low–high), hours_to_threshold
@@ -673,27 +737,42 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
     - jump — регулярний стрибок (напр. щоденний бекап): next_local, size_gb, free_then_gb,
       fits (поміститься), short_gb (фізично бракує), free_to_stay_below_gb (скільки звільнити,
       щоб лишитися нижче порогу).
-    threshold_pct — поріг (90 %).
+    threshold_pct — поріг (90 %); to_threshold_pp і to_threshold_gb — скільки лишилось до порогу.
+    Якщо даних свіжих немає (stale) — прогнозу на «зараз» немає (disks відсутнє), а
+    forecast_at_last_data — прогноз на момент останніх даних, НЕ на зараз.
     """
     cfg = forecast.load_config()
     with connect() as conn:
         s = find_server(conn, server)
         t, _ = resolve_now(conn, s, now)
+        fresh = freshness(conn, s["id"], t)
         drives = forecast.list_disks(conn, s["id"])
         if drive:
             if drive.upper() not in drives:
                 raise ToolError(f"на {server} немає диска «{drive}»", known_disks=drives)
             drives = [drive.upper()]
+        # Немає свіжих даних — прогноз рахуємо на момент останніх даних, а не на «зараз»:
+        # інакше «+24 год» і «регулярних стрибків немає» стосувалися б часу, коли даних немає
+        at = parse_db(last_ts_before(conn, s["id"], t)) if fresh["stale"] else t
         method = forecast.get_method(cfg["method"])
         out = []
         for d in drives:
-            used, free = forecast.load_disk(conn, s["id"], d, t, cfg)
+            used, free = forecast.load_disk(conn, s["id"], d, at, cfg)
             if len(used) < 2 or free.empty:
                 out.append({"drive": d, "error": "замало даних для прогнозу"})
                 continue
-            out.append(disk_answer(d, method.predict(used, free, t, cfg), t, cfg, with_line))
-    return {"server": server, "now": pair(t), "method": cfg["method"],
-            "threshold_pct": cfg["threshold_pct"], "disks": out}
+            out.append(disk_answer(d, method.predict(used, free, at, cfg), at, cfg, with_line))
+    result = {"server": server, "now": pair(t), "method": cfg["method"],
+              "threshold_pct": cfg["threshold_pct"], **fresh}
+    if fresh["stale"]:
+        result["message"] = (f"немає свіжих даних; останні — {fresh['data_until']['ts_local']} "
+                             f"({age_text(fresh['data_age_h'])} тому). Прогнозу на «зараз» немає")
+        result["forecast_at_last_data"] = {
+            "at": pair(at), "note": f"прогноз на момент останніх даних ({loc(at)}), а НЕ на зараз",
+            "disks": out}
+    else:
+        result["disks"] = out
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +797,7 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
 
     Коли викликати: «Що сталося на sim-1 за ніч?», «Чому впав сайт?», «Що було перед падінням пулу?».
     Параметри: start, end — місцевий час (за замовчуванням 24 год до now); now — момент
-    «зараз» (None — останні дані); limit — скільки записів (якщо більше — останні).
+    «зараз» (None — поточний час); limit — скільки записів (якщо більше — останні).
     Повертає items у хронологічному порядку: ts_local, type (event — подія журналу рівня
     Warning і вище, а також 7036 і 18264; service — зміна стану служби чи пулу; check —
     зміна результату перевірки; alert — алерт), source, code, level, text.
@@ -728,7 +807,19 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
     with connect() as conn:
         s = find_server(conn, server)
         t_now, _ = resolve_now(conn, s, now)
+        fresh = freshness(conn, s["id"], t_now)
         start_t, end_t = window(t_now, start, end)
+        # Дані сервера закінчились до початку вікна — порожній список вводив би в оману
+        # («нічого не сталося»), тому кажемо прямо: немає даних
+        last_raw = last_ts_before(conn, s["id"], end_t)
+        if last_raw is None or parse_db(last_raw) <= start_t:
+            raise ToolError(f"немає даних за період {loc(start_t)} – {loc(end_t)} (місц.); "
+                            f"останні — {loc(last_raw) or 'немає'}", **fresh)
+        last = parse_db(last_raw)
+        notes = []
+        if (end_t - last).total_seconds() / 60 > STALE_MIN:
+            notes.append(f"дані закінчуються о {loc(last)}: після цього подій не видно не тому, "
+                         f"що їх не було, а тому, що даних немає")
         lo, hi = db_ts(start_t), cutoff(end_t)
         items, noise = [], {}
         for r in conn.execute("SELECT ts, log, source, event_id, level, message FROM events "
@@ -768,11 +859,10 @@ def get_timeline(server: str, start: str | None = None, end: str | None = None,
     items = items[-limit:]
     # час у відповіді — місцевий, першим полем
     items = [{"ts_local": loc(x["ts"]), **{k: v for k, v in x.items() if k != "ts"}} for x in items]
-    out = {"server": server, "from_local": loc(start_t), "to_local": loc(end_t),
-           "items": items, "noise": noise, "counts": counts}
     if total > len(items):
-        out["notes"] = [f"показано останні {len(items)} з {total} записів"]
-    return out
+        notes.append(f"показано останні {len(items)} з {total} записів")
+    return {"server": server, "from_local": loc(start_t), "to_local": loc(end_t),
+            "items": items, "noise": noise, "counts": counts, **fresh, "notes": notes}
 
 
 # ---------------------------------------------------------------------------

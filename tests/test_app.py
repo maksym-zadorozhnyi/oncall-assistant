@@ -84,6 +84,7 @@ def test_page_edge_cases(tmp_path, monkeypatch):
     st.cache_data.clear()
     at = AppTest.from_file(APP, default_timeout=60)
     at.query_params["drive"] = "D:"
+    at.query_params["now"] = "2026-01-07 01:59"            # момент останніх даних (місцевий)
     at.run()
     assert not at.exception
     assert any("Прогноз для D:" in w.value and "замало даних" in w.value for w in at.warning)
@@ -92,3 +93,24 @@ def test_page_edge_cases(tmp_path, monkeypatch):
     assert "За типами: події журналу — 0" in captions and "1014 × 1" in captions
     assert "{" not in captions.split("За типами:")[1].split(".")[0]
     assert len(at.metric) == 6                             # CPU, RAM, C:, D:, відповідь, помилки
+    assert "агент знає лише розмір" not in captions        # постійні примітки — лише для LLM
+
+
+def test_page_late_moment_is_marked_stale(tmp_path, monkeypatch):
+    """Момент на 3 доби пізніше за дані: «сервер замовк» у добах, блоки підписані
+    «останні відомі дані», прогнозу «на зараз» немає, і сторінка не падає."""
+    path = tmp_path / "t.db"
+    two_days(path)
+    monkeypatch.setattr(tools, "DB_PATH", path)
+    st.cache_data.clear()
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.query_params["now"] = "2026-01-10 01:59"
+    at.run()
+    assert not at.exception
+    errors = " ".join(e.value for e in at.error)
+    assert "Сервер замовк" in errors and "3,0 дн" in errors
+    captions = " ".join(c.value for c in at.caption)
+    assert captions.count("останні відомі дані на 2026-01-07 01:59") >= 4
+    warnings = " ".join(w.value for w in at.warning)
+    assert "немає свіжих даних" in warnings and "Прогнозу на «зараз» немає" in warnings
+    assert "немає даних" in warnings                        # графіки, теки, хронологія
