@@ -1,0 +1,223 @@
+"""Тести функцій-інструментів (core/tools.py). Запуск: python -m pytest
+
+Тимчасова база з даними, написаними вручну (data/oncall.db не чіпають).
+Сервер t-1, дані 2 доби з 2026-01-05 00:00 UTC (= 02:00 місцевого, UTC+2).
+Позначки нижче — хвилини від початку другої доби (D):
+- CPU: 10 + (хв mod 7); D+60 — викид 95 %; D+30 — заповнена точка;
+- D+100…D+109 — пропуск (немає жодних даних);
+- диск C: 100 ГБ, рівний ріст 2 %/добу від 40 %;
+- тека C:\\Logs росте 1 ГБ/добу, диск — 2 ГБ/добу (решта — «інше»);
+- процеси — знімки кожні 5 хв лише до D+60;
+- SitePool: стоп о D+50, знову працює о D+70; HTTP: помилка D+52…D+71;
+- події: 1014 × 3 (шум), WAS 5009 о D+50, 7036 о D+70, звичайна інформаційна 100.
+"""
+import json
+
+import pandas as pd
+import pytest
+
+from core import forecast as fc
+from core import tools
+from core.db import db_session, init_db
+
+T0 = pd.Timestamp("2026-01-05T00:00:00Z")
+D = 1440                                   # початок другої доби, хв
+MINUTES = 2 * 1440
+GAP = range(D + 100, D + 110)
+
+
+def ts(minute: int, sec: int = 0) -> str:
+    return (T0 + pd.Timedelta(minutes=minute, seconds=sec)).strftime(tools.TS_FORMAT)
+
+
+def local(minute: int) -> str:
+    """Той самий момент місцевим часом, як його вводить людина."""
+    return (T0 + pd.Timedelta(minutes=minute)).tz_convert(tools.LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def disk_used(i: int) -> float:
+    return round(40 + 2 * i / 1440, 3)
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    path = tmp_path / "test.db"
+    init_db(path)
+    monkeypatch.setattr(tools, "DB_PATH", path)
+    inv = {"sites": [{"name": "portal.example.com", "app_pool": "SitePool"}],
+           "services": [{"name": "SvcA", "exe": "a.exe"}, {"name": "W3SVC", "exe": "svchost.exe"},
+                        {"name": "WAS", "exe": "svchost.exe"}]}
+    with db_session(path) as conn:
+        conn.execute("INSERT INTO servers (name, kind, description, inventory_json) VALUES (?, ?, ?, ?)",
+                     ("t-1", "sim", "тестовий", json.dumps(inv)))
+        rows = []
+        for i in range(MINUTES):
+            if i in GAP:
+                continue
+            cpu, imp, out = 10 + i % 7, 0, 0
+            if i == D + 60:
+                cpu, out = 95, 1
+            if i == D + 30:
+                imp = 1
+            used = disk_used(i)
+            rows += [(ts(i), 1, "cpu_pct", cpu, imp, out), (ts(i), 1, "ram_pct", 50, 0, 0),
+                     (ts(i), 1, "disk_used_pct:C:", used, 0, 0),
+                     (ts(i), 1, "disk_free_gb:C:", round(100 - used, 3), 0, 0)]
+        conn.executemany("INSERT INTO metrics_clean VALUES (?, ?, ?, ?, ?, ?)", rows)
+        conn.executemany("INSERT INTO disk_usage VALUES (?, 1, 'C:', ?, ?, 100)",
+                         [(ts(i, 1), disk_used(i), 100 - disk_used(i)) for i in range(0, MINUTES, 60)])
+        for i in range(0, D + 61, 5):            # знімки процесів (секунди, як у сирих даних)
+            conn.executemany("INSERT INTO process_snapshots VALUES (?, 1, ?, ?, ?, ?, ?)", [
+                (ts(i, 3), "a.exe", 11, 70.0, 300, None),
+                (ts(i, 3), "svchost.exe", 12, 5.0, 900, None),
+                (ts(i, 3), "w3wp.exe", 13, 1.0, 500, "SitePool")])
+        for i in range(0, MINUTES, 5):           # тека C:\Logs росте 1 ГБ/добу
+            conn.execute("INSERT INTO folder_sizes VALUES (?, 1, ?, ?)", (ts(i, 2), "C:\\Logs", 10 + i / 1440))
+        for i in range(0, MINUTES, 5):           # служби
+            pool = "stopped" if D + 50 <= i < D + 70 else "running"
+            conn.executemany("INSERT INTO service_status VALUES (?, 1, ?, ?, ?)", [
+                (ts(i, 4), "SvcA", "service", "running"), (ts(i, 4), "SitePool", "apppool", pool)])
+        for i in range(0, MINUTES):              # HTTP щохвилини
+            bad = D + 52 <= i < D + 72
+            conn.execute("INSERT INTO checks VALUES (?, 1, 'http', ?, ?, ?)",
+                         (ts(i, 5), 0 if bad else 1, 20 if bad else 150, "HTTP 503" if bad else "HTTP 200"))
+        conn.executemany("INSERT INTO events VALUES (?, 1, ?, ?, ?, ?, ?)", [
+            (ts(D + 10), "System", "DNS", 1014, "Warning", "Name resolution timed out"),
+            (ts(D + 20), "System", "DNS", 1014, "Warning", "Name resolution timed out"),
+            (ts(D + 40), "System", "DNS", 1014, "Warning", "Name resolution timed out"),
+            (ts(D + 45), "Application", "App", 100, "Information", "щось звичайне"),
+            (ts(D + 50), "System", "WAS", 5009, "Warning", "A process serving application pool 'SitePool' terminated unexpectedly."),
+            (ts(D + 70), "System", "Service Control Manager", 7036, "Information", "The service entered the running state.")])
+    return path
+
+
+# ---------------------------------------------------------------------------
+
+def test_local_time_to_utc():
+    """Час без поясу — місцевий UTC+2; з поясом — як є."""
+    assert tools.to_utc("2026-01-05 02:00") == T0
+    assert tools.to_utc("2026-01-05T00:00:00Z") == T0
+    assert tools.to_utc(None) is None
+    assert tools.pair(T0) == {"ts_utc": "2026-01-05 00:00", "ts_local": "2026-01-05 02:00"}
+
+
+def test_status_last_values_no_future(db):
+    """Стан — останні значення до now; дані після now не потрапляють."""
+    r = tools.get_status("t-1", now=local(D + 60))
+    assert r["data_until"]["ts_local"] == local(D + 60)
+    assert r["metrics"]["cpu_pct"] == 95                   # саме хвилина D+60, а не пізніша
+    assert r["disks"][0]["used_pct"] == round(disk_used(D + 60), 1)
+    assert r["disks"][0]["total_gb"] == 100
+    assert r["stale"] is False
+    pool = next(s for s in r["services"] if s["name"] == "SitePool")
+    assert pool["status"] == "stopped" and pool["since_local"] == local(D + 50)
+    assert r["not_running"] == ["SitePool"]
+    assert r["checks"]["http"]["ok"] is False and r["checks"]["http"]["details"] == "HTTP 503"
+    svc = next(s for s in r["services"] if s["name"] == "SvcA")
+    assert svc["since_note"] == "стан не змінювався з початку даних"
+
+
+def test_status_stale_and_live(db):
+    """Після кінця даних сервер «замовк»; «наживо» — останні дані."""
+    r = tools.get_status("t-1", now=local(MINUTES + 20))
+    assert r["stale"] is True and r["silent_min"] == 21
+    live = tools.get_status("t-1")
+    assert live["live"] is True and live["data_until"]["ts_local"] == local(MINUTES - 1)
+
+
+def test_history_gap_imputed_outliers(db):
+    """Пропуск знаходиться; заповнені точки і викиди рахуються; після now — нічого."""
+    r = tools.get_metric_history("t-1", "cpu_pct", start=local(D), end=local(D + 180), now=local(D + 150))
+    assert r["to_local"] == local(D + 150) and r["last"] == 10 + (D + 150) % 7
+    assert r["points"] == 150 - len(GAP)
+    assert r["imputed"] == 1 and r["outliers"] == 1
+    assert r["outlier_points"] == [[local(D + 60), 95]]
+    assert r["max"] == {"value": 95, "ts_local": local(D + 60)}
+    assert r["gaps"] == [{"from_local": local(D + 99), "to_local": local(D + 110), "missing_min": 10}]
+
+
+def test_history_thinning(db):
+    """Довгий ряд проріджується до max_points; короткий — без змін."""
+    r = tools.get_metric_history("t-1", "cpu_pct", now=local(MINUTES - 1), max_points=20)
+    assert len(r["series"]) <= 20 and r["step_min"] > 1
+    r = tools.get_metric_history("t-1", "ram_pct", start=local(D), end=local(D + 30), max_points=50)
+    assert len(r["series"]) == 30 and r["step_min"] == 1
+
+
+def test_top_processes_nearest_snapshot(db):
+    """Береться найближчий знімок не пізніше at; служба — лише якщо exe належить одній."""
+    r = tools.get_top_processes("t-1", at=local(D + 63), by="cpu")
+    assert r["snapshot_local"] == local(D + 60)
+    assert r["cpu_server"] == 95                            # CPU сервера в ту хвилину
+    first = r["processes"][0]
+    assert first["name"] == "a.exe" and first["service"] == "SvcA"
+    svchost = next(p for p in r["processes"] if p["name"] == "svchost.exe")
+    assert svchost["service"] is None                       # svchost.exe — дві служби
+    assert tools.get_top_processes("t-1", at=local(D + 63), by="ram")["processes"][0]["name"] == "svchost.exe"
+
+
+def test_top_processes_no_snapshot(db):
+    """Знімок давніший за 10 хв — зрозуміла помилка, не виняток."""
+    r = tools.get_top_processes("t-1", at=local(D + 100))
+    assert "немає знімка" in r["error"] and r["nearest_snapshot_local"] == local(D + 60)
+
+
+def test_folder_growth_and_other(db):
+    """Ріст теки і «інше» = ріст диска − сума тек."""
+    r = tools.get_folder_growth("t-1", period_h=12, now=local(D + 720))
+    f = r["folders"][0]
+    assert f["path"] == "C:\\Logs" and f["growth_gb"] == 0.5 and f["growth_gb_per_day"] == 1.0
+    d = r["disks"][0]                                       # диск: 2 %/добу = 1 ГБ за 12 год
+    assert d["drive"] == "C:" and d["growth_gb"] == 1.0 and d["folders_gb"] == 0.5 and d["other_gb"] == 0.5
+
+
+def test_timeline_changes_and_noise(db):
+    """Хронологія: зміни стану знайдено, шум згорнуто, порядок за часом."""
+    r = tools.get_timeline("t-1", start=local(D), end=local(D + 120), now=local(D + 120))
+    kinds = [(x["ts_local"], x["type"]) for x in r["items"]]
+    assert kinds == [(local(D + 50), "event"), (local(D + 50), "service"), (local(D + 52), "check"),
+                     (local(D + 70), "event"), (local(D + 70), "service"), (local(D + 72), "check")]
+    assert r["items"][1]["text"] == "SitePool (apppool): running -> stopped"
+    assert r["noise"] == {"1014": 3}
+    assert r["counts"] == {"event": 2, "service": 2, "check": 2, "alert": 0}
+    assert all(x["code"] != 100 for x in r["items"])         # звичайна інформаційна — не показуємо
+
+
+def test_timeline_change_at_window_start(db):
+    """Зміна одразу на початку вікна видна завдяки останньому запису перед вікном."""
+    r = tools.get_timeline("t-1", start=local(D + 47), end=local(D + 55), now=local(D + 55))
+    assert any(x["type"] == "service" and x["ts_local"] == local(D + 50) for x in r["items"])
+
+
+def test_disk_forecast_same_as_forecast_module(db):
+    """Обгортка дає ті самі числа, що й core/forecast.py (одне джерело чисел)."""
+    r = tools.get_disk_forecast("t-1", drive="C:", now=local(MINUTES - 1), with_line=True)
+    d = r["disks"][0]
+    cfg = fc.load_config()
+    now = T0 + pd.Timedelta(minutes=MINUTES - 1)
+    with db_session(db) as conn:
+        used, free = fc.load_disk(conn, 1, "C:", now, cfg)
+    direct = fc.LinearMethod().predict(used, free, now, cfg)
+    assert d["trend"]["pct_per_day"] == round(direct["trend"]["speed_pct_day"], 2)
+    assert abs(d["trend"]["pct_per_day"] - 2) < 0.05
+    assert d["trend"]["hours_to_threshold"] == round(direct["trend"]["hours_to_threshold"], 1)
+    assert d["fast_growth"]["unusual"] is False and d["jump"]["found"] is False
+    assert len(d["trend_line"]) > 10
+
+
+def test_errors_are_readable(db):
+    """Невідомий сервер, метрика, диск і момент до початку даних — словник з поясненням."""
+    r = tools.get_status("sim-9")
+    assert "невідомий сервер" in r["error"] and r["known_servers"] == ["t-1"]
+    r = tools.get_status("t-1", now="2025-12-01 10:00")
+    assert "немає даних" in r["error"]
+    assert "known_metrics" in tools.get_metric_history("t-1", "cpu")
+    assert "known_disks" in tools.get_disk_forecast("t-1", drive="Z:")
+    r = tools.get_metric_history("t-1", "cpu_pct", start=local(D + 101), end=local(D + 108))
+    assert "немає даних" in r["error"] and r["nearest_data_local"] == local(D + 99)
+    assert "error" in tools.get_status("t-1", now="вчора")
+
+
+def test_all_tools_registered():
+    assert set(tools.TOOLS) == {"list_servers", "get_status", "get_metric_history", "get_top_processes",
+                                "get_folder_growth", "get_disk_forecast", "get_timeline"}
