@@ -243,6 +243,19 @@ def test_top_processes_no_snapshot(db):
     assert "немає знімка" in r["error"] and r["nearest_snapshot_local"] == local(D + 60)
 
 
+def test_top_processes_at_past(db):
+    """at — знімок у минулому (не пізніший за at); at пізніше «зараз» — помилка."""
+    r = tools.get_top_processes("t-1", now=local(D + 200), at=local(D + 33))
+    assert r["snapshot_local"] == local(D + 30)             # знімок D+35 — уже після at
+    assert r["at_local"] == local(D + 33)
+    assert r["processes"][0]["name"] == "a.exe"
+    assert "at_local" not in tools.get_top_processes("t-1", now=local(D + 63))
+    late = tools.get_top_processes("t-1", now=local(D + 40), at=local(D + 50))
+    assert "пізніший за «зараз»" in late["error"]
+    far = tools.get_top_processes("t-1", now=local(D + 200), at=local(D + 100))
+    assert "немає знімка" in far["error"] and far["nearest_snapshot_local"] == local(D + 60)
+
+
 def test_folder_growth_and_other(db):
     """Ріст теки і «інше» = ріст диска − сума тек."""
     r = tools.get_folder_growth("t-1", period_h=12, now=local(D + 720))

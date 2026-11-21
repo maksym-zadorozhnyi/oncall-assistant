@@ -537,20 +537,22 @@ def get_metric_history(server: str, metric: str, start: str | None = None, end: 
 # ---------------------------------------------------------------------------
 
 @tool
-def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top: int = 5) -> dict:
-    """Процеси з найбільшим навантаженням на момент «зараз» (останній знімок до нього).
+def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top: int = 5,
+                      at: str | None = None) -> dict:
+    """Процеси з найбільшим навантаженням: на момент «зараз» або на вказаний час у минулому.
 
     Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «чого sim-1 тупить?»,
-    «який пул жере проц?», «Чому гальмує сервер?» (разом зі станом).
-    Не вміє: процеси в минулий момент — лише останній знімок до «зараз» (не давніший
-    за 10 хв; інакше — помилка «немає знімка»); історію CPU (get_metric_history).
+    «який пул жере проц?», «Чому гальмує сервер?» (разом зі станом); з at — «що вантажило
+    CPU вчора о 14:00» (спершу знайди час піку через get_metric_history, потім at = цей час).
+    Не вміє: час пізніше за «зараз» (помилка); період — лише один знімок, останній до at
+    (не давніший за 10 хв; інакше — помилка «немає знімка»); історію CPU (get_metric_history).
     Повертає: snapshot_local (час знімка), cpu_server і ram_server_pct (CPU і RAM сервера
     в ту хвилину — щоб порівняти з процесом), processes: name, pid, cpu_pct (0–100 % від
     усього CPU), ram_mb, app_pool (для w3wp.exe), service (служба, якщо цей exe належить
-    лише одній службі за інвентарем).
+    лише одній службі за інвентарем); з at — ще at_local.
 
     Лише для коду: now — момент, місцевий час (None — поточний час); by — "cpu" або "ram";
-    top — скільки процесів.
+    top — скільки процесів; at — час знімка, місцевий (None — «зараз»), не пізніше за now.
     """
     if by not in ("cpu", "ram"):
         raise ToolError(f"by має бути cpu або ram, а не «{by}»")
@@ -559,13 +561,19 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
         s = find_server(conn, server)
         t, _ = resolve_now(conn, s, now)
         fresh = freshness(conn, s["id"], t)
-        lo = db_ts(t - pd.Timedelta(minutes=SNAPSHOT_MAX_MIN))
+        # Час знімка: «зараз» або at (не пізніше «зараз» — майбутнього бот не бачить)
+        at_t = to_utc(at)
+        if at_t is not None and at_t > t:
+            raise ToolError(f"час {loc(at_t)} пізніший за «зараз» ({loc(t)}); "
+                            f"процеси можна подивитися лише на «зараз» або раніше")
+        snap_t = at_t if at_t is not None else t
+        lo = db_ts(snap_t - pd.Timedelta(minutes=SNAPSHOT_MAX_MIN))
         snap = conn.execute("SELECT MAX(ts) FROM process_snapshots WHERE server_id = ? AND ts < ? AND ts >= ?",
-                            (s["id"], cutoff(t), lo)).fetchone()[0]
+                            (s["id"], cutoff(snap_t), lo)).fetchone()[0]
         if snap is None:
             near = conn.execute("SELECT MAX(ts) FROM process_snapshots WHERE server_id = ? AND ts < ?",
-                                (s["id"], cutoff(t))).fetchone()[0]
-            raise ToolError(f"немає знімка процесів за {SNAPSHOT_MAX_MIN} хв до {loc(t)} (місц.); "
+                                (s["id"], cutoff(snap_t))).fetchone()[0]
+            raise ToolError(f"немає знімка процесів за {SNAPSHOT_MAX_MIN} хв до {loc(snap_t)} (місц.); "
                             f"останній — {loc(near) or 'немає'}", nearest_snapshot_local=loc(near), **fresh)
         order = "cpu_pct" if by == "cpu" else "ram_mb"
         rows = conn.execute(f"SELECT name, pid, cpu_pct, ram_mb, app_pool FROM process_snapshots "
@@ -583,9 +591,12 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
               "ram_mb": num(r["ram_mb"], 0), "app_pool": r["app_pool"],
               "service": owners[r["name"].lower()][0] if len(owners.get(r["name"].lower(), [])) == 1 else None}
              for r in rows]
-    return {"server": server, "snapshot_local": loc(snap), "by": by,
-            "cpu_server": num(m.get("cpu_pct"), 1), "ram_server_pct": num(m.get("ram_pct"), 1),
-            "processes": procs, **fresh}
+    out = {"server": server, "snapshot_local": loc(snap), "by": by,
+           "cpu_server": num(m.get("cpu_pct"), 1), "ram_server_pct": num(m.get("ram_pct"), 1),
+           "processes": procs, **fresh}
+    if at_t is not None:
+        out["at_local"] = loc(at_t)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +965,7 @@ def main() -> None:
     parser.add_argument("--drive")
     parser.add_argument("--by")
     parser.add_argument("--top", type=int)
+    parser.add_argument("--at", help="get_top_processes: час знімка в минулому, місцевий")
     parser.add_argument("--period-h", dest="period_h", type=float)
     parser.add_argument("--max-points", dest="max_points", type=int)
     parser.add_argument("--limit", type=int)

@@ -81,7 +81,11 @@ def build_specs(servers: list | None = None) -> list[dict]:
             "by": {"type": "string", "enum": ["cpu", "ram"],
                    "description": "сортувати за CPU або за пам'яттю; не вказуйте — cpu"},
             "top": {"type": "integer", "minimum": 1,
-                    "description": "скільки процесів; не вказуйте — 5 (у знімку їх до 10)"}}, ["server"]),
+                    "description": "скільки процесів; не вказуйте — 5 (у знімку їх до 10)"},
+            "at": {"type": "string",
+                   "description": f"час знімка в минулому, {TIME_NOTE}; не пізніше «зараз»; "
+                                  f"наприклад, що вантажило CPU вчора о 14:00 — at = вчорашня дата 14:00; "
+                                  f"не вказуйте — «зараз»"}}, ["server"]),
         "get_folder_growth": ({
             "server": server,
             "period_h": {"type": "number", "minimum": 1,
