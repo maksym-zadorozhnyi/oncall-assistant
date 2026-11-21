@@ -28,6 +28,9 @@ docs/experiments/forecast/moment_*.png
 # python -m core.forecast_bench --run; у Git — звіт, графіки і runs.csv
 docs/experiments/forecast/backtest.csv
 
+# Таблиця інцидентів для людини (ключ відповідей іспиту) — лише локально
+docs/experiments/sim_incidents.md
+
 # Векторна база ChromaDB (перебудовується з knowledge/runbooks)
 data/chroma/
 

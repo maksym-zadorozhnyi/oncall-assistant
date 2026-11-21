@@ -239,11 +239,12 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: Path = DB_PATH, timeout_s: float = 30) -> sqlite3.Connection:
     """Відкриває з'єднання з базою з потрібними налаштуваннями."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # timeout: якщо інший процес саме пише, чекаємо до 30 с, а не падаємо
-    conn = sqlite3.connect(db_path, timeout=30)
+    # timeout (= PRAGMA busy_timeout): якщо інший процес саме пише, чекаємо
+    # до timeout_s секунд, а не падаємо одразу з «database is locked»
+    conn = sqlite3.connect(db_path, timeout=timeout_s)
     # Рядки можна читати за назвою колонки: row["cpu_pct"]
     conn.row_factory = sqlite3.Row
     # Перевірка зовнішніх ключів (у SQLite за замовчуванням вимкнена)
@@ -254,7 +255,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 @contextmanager
-def db_session(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
+def db_session(db_path: Path = DB_PATH, timeout_s: float = 30) -> Iterator[sqlite3.Connection]:
     """Відкриває з'єднання на час одного блоку роботи і завжди його закриває.
 
     Використання:
@@ -269,7 +270,7 @@ def db_session(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
     Увага: стандартне `with sqlite3.connect(...)` лише комітить,
     але НЕ закриває з'єднання, тому в проєкті використовуємо db_session().
     """
-    conn = get_connection(db_path)
+    conn = get_connection(db_path, timeout_s)
     try:
         yield conn
         conn.commit()

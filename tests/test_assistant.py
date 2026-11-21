@@ -171,7 +171,8 @@ def test_history_text_only_with_seen_line(db):
     s = A.Session(now=MOMENT)
     A.ask("Коли заповниться C:?", s, chat_fn=FakeLLM(
         reply(calls=[("get_disk_forecast", {"server": "t-1", "drive": "C:"})]), reply("Через 2 доби.")))
-    assert s.history[1] == {"role": "assistant", "content": "Через 2 доби.\nДивився: прогноз диска (t-1, C:)"}
+    assert s.history[1] == {"role": "assistant",
+                            "content": "Через 2 доби.\n[система: дивився прогноз диска (t-1, C:)]"}
     fake = FakeLLM(reply("ок"))
     A.ask("а що там росте?", s, chat_fn=fake)
     msgs = fake.requests[0]["messages"]
@@ -252,8 +253,50 @@ def test_prompt_rules():
     """Правила зупинки 1 є в промпті."""
     p = A.PROMPT_PATH.read_text(encoding="utf-8")
     for rule in ("десятковий роздільник — кома", "Не порівнюй числа словами", "виклич її сам",
-                 "Не називай користувачу назв функцій"):
+                 "Не називай користувачу назв функцій", "Не пропонуй «можу перевірити X»",
+                 "якщо ти цих\n    даних не запитував", "Числа з попередніх відповідей — на їхній час",
+                 "додає\n    система — не пиши їх сам", "на «ви»"):
         assert rule in p
+
+
+def test_live_moment_fixed_once(db, monkeypatch):
+    """Живий режим: «зараз» фіксується на початку питання — промпт і всі функції мають
+    той самий момент, навіть якщо годинник пішов далі; момент — у журналі; мітка часу в історії."""
+    ticks = iter(pd.Timestamp(local(D + 60), tz=tools.LOCAL_TZ) + pd.Timedelta(minutes=i) for i in range(100))
+    monkeypatch.setattr(A, "local_now", lambda: next(ticks))     # кожен виклик — на хвилину пізніше
+    fake = FakeLLM(reply(calls=[("get_status", {"server": "t-1"}), ("get_disk_forecast", {"server": "t-1"})]),
+                   reply("ок"))
+    s = A.Session()                                                # now = None — живий режим
+    ans = A.ask("Що з t-1?", s, chat_fn=fake)
+    results = [json.loads(b["content"]) for b in tool_results(fake.requests[1])]
+    assert [r["now"]["ts_local"] for r in results] == [MOMENT, MOMENT]   # обидві — та сама хвилина
+    assert results[0]["live"] is True                                # чесно: це живий режим
+    assert "Зараз: вівторок, 06.01.2026 03:00" in fake.requests[0]["system"]
+    assert A.MOMENT_NOTE not in fake.requests[0]["system"]
+    assert fake.requests[0]["messages"][-1]["content"] == "[06.01 03:00] Що з t-1?"
+    assert s.history[0]["content"] == "[06.01 03:00] Що з t-1?" and s.now is None
+    assert ans.moment == MOMENT and ans.live is True and "Момент:" not in ans.text
+    rec = json.loads(A.LOG_PATH.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["moment"] == MOMENT and rec["live"] is True
+    # момент в історії — без мітки часу і з live = false
+    fake = FakeLLM(reply(calls=[("get_status", {"server": "t-1"})]), reply("ок"))
+    A.ask("Що з t-1?", A.Session(now=MOMENT), chat_fn=fake)
+    assert fake.requests[0]["messages"][-1]["content"] == "Що з t-1?"
+    assert json.loads(tool_results(fake.requests[1])[0]["content"])["live"] is False
+
+
+def test_service_lines_not_duplicated(db):
+    """Модель скопіювала «Дивився» / «Момент» з історії — код їх вирізає; у відповіді один
+    справжній «Дивився»; в історії — «[система: дивився …]», який модель не бере за зразок."""
+    copied = "Пам'ять у нормі.\n\nДивився: стан (t-1, t-2)\n\nДивився: стан (t-1)\nМомент: 06.01 03:00 (історія)"
+    s = A.Session(now=MOMENT)
+    ans = A.ask("Що з пам'яттю?", s, chat_fn=FakeLLM(reply(calls=[("get_status", {"server": "t-1"})]),
+                                                     reply(copied)))
+    assert ans.llm_text == "Пам'ять у нормі."
+    assert ans.text.count("Дивився:") == 1 and ans.text.count("Момент:") == 1
+    assert "Дивився:" not in s.history[1]["content"]
+    assert s.history[1]["content"] == "Пам'ять у нормі.\n[система: дивився стан (t-1)]"
+    assert A.strip_service_lines("⚠ дані застарілі: останні на 06.01\nТекст") == "Текст"
 
 
 def test_parse_moment(db):
@@ -264,6 +307,13 @@ def test_parse_moment(db):
     assert A.parse_moment("+30m", MOMENT, servers)[0] == local(D + 90)
     assert A.parse_moment("live", MOMENT, servers) == (None, None)
     assert A.parse_moment(local(D), None, servers) == (local(D), None)
+    # дата як у людини: «06.01.2026 03:00» і «06.01 03:00» (рік — поточного моменту)
+    assert A.parse_moment("06.01.2026 03:00", None, servers) == (MOMENT, None)
+    assert A.parse_moment("06.01 03:00", MOMENT, servers) == (MOMENT, None)
+    assert A.parse_moment("6.1 3:00", MOMENT, servers) == (MOMENT, None)
+    for bad in ("31.02 10:00", "2026-18-11 22:00", "18/11 22:00"):
+        with pytest.raises(A.MomentError):
+            A.parse_moment(bad, MOMENT, servers)
     late, warning = A.parse_moment("+2d", MOMENT, servers)
     assert late == local(D + 60 + 2880) and "даних немає" in warning
     for bad in ("-2d", "2027-01-01 00:00", "вчора", ""):

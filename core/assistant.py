@@ -45,6 +45,8 @@ WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
 MOMENT_NOTE = "Це момент в історії: говори так, наче зараз — цей момент; даних після нього немає."
 SHIFT_RE = re.compile(r"^([+-])\s*(\d+)\s*([mhd])$")        # +1h, -1d, +30m
 UNITS = {"m": "minutes", "h": "hours", "d": "days"}
+DMY_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})$")   # 18.11.2026 22:00, 18.11 22:00
+MOMENT_EXAMPLES = "2026-11-10 08:00, 10.11.2026 08:00, 10.11 08:00, +1h, -1d, live"
 # Число у тексті: не частина назви (sim-1, w3wp, UTC+2) і не продовження іншого числа
 NUMBER_RE = re.compile(r"(?<![\w.,:+\-])\d+(?:[.,]\d+)?(?![\w])")
 
@@ -85,9 +87,10 @@ class Answer:
     ms_total: int
     stale: bool
     error: str | None
-    moment: str | None
+    moment: str                        # момент цього питання (і в живому режимі — зафіксований)
     model: str
     effort: str
+    live: bool = False                 # True — живий режим
 
 
 # ---------------------------------------------------------------------------
@@ -129,20 +132,35 @@ def parse_moment(text: str, current: str | None, servers: list | None = None) ->
     з попередженням (тоді відповіді будуть з позначкою «дані застарілі»)."""
     text = (text or "").strip()
     if not text:
-        raise MomentError("момент не задано; приклади: 2026-11-10 08:00, +1h, -1d, live")
+        raise MomentError(f"момент не задано; приклади: {MOMENT_EXAMPLES}")
     if text.lower() == "live":
         return None, None
     m = SHIFT_RE.match(text.lower())
+    d = DMY_RE.match(text)
     if m:
         sign, amount, unit = m.groups()
         base = as_local(current) if current else local_now()
         delta = pd.Timedelta(**{UNITS[unit]: int(amount)})
         t = base + delta if sign == "+" else base - delta
+    elif d:
+        # «18.11.2026 22:00» або «18.11 22:00» (без року — рік поточного моменту;
+        # якщо так виходить майбутнє — попередній рік)
+        day, month, year, hh, mm = d.groups()
+        base = as_local(current) if current else local_now()
+        years = [int(year)] if year else [base.year, base.year - 1]
+        t = None
+        for y in years:
+            try:
+                t = as_local(f"{y:04d}-{int(month):02d}-{int(day):02d} {int(hh):02d}:{mm}")
+            except (tools.ToolError, ValueError):
+                raise MomentError(f"немає такої дати «{text}»; приклади: {MOMENT_EXAMPLES}") from None
+            if year or t <= local_now():
+                break
     else:
         try:
             t = as_local(text)
         except tools.ToolError:
-            raise MomentError(f"не розумію момент «{text}»; приклади: 2026-11-10 08:00, +1h, -1d, live") from None
+            raise MomentError(f"не розумію момент «{text}»; приклади: {MOMENT_EXAMPLES}") from None
     if servers is None:
         servers = tools.list_servers().get("servers", [])
     first, last = data_bounds(servers)
@@ -291,9 +309,23 @@ def fit_result(result: dict, max_kb: float) -> tuple[dict, list]:
     return result, notes
 
 
-def run_tool(call, session: Session, specs: list, cfg: dict) -> tuple[dict, str, dict]:
+def mark_live(obj) -> None:
+    """У живому режимі функції отримують зафіксований момент питання (рядок), тому
+    вважають його «моментом в історії» (live = false). Повертаємо правду: live = true."""
+    if isinstance(obj, dict):
+        if "live" in obj:
+            obj["live"] = True
+        for v in obj.values():
+            mark_live(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            mark_live(v)
+
+
+def run_tool(call, now: str, live: bool, specs: list, cfg: dict) -> tuple[dict, str, dict]:
     """Виконати одну функцію на запит LLM. Повертає (результат, JSON для LLM, запис для журналу).
-    now — лише з сесії; параметри, яких немає в описі для LLM (зокрема now), — ігноруються."""
+    now — момент цього питання (один для всіх функцій); параметри, яких немає в описі
+    для LLM (зокрема now), — ігноруються."""
     t0 = time.perf_counter()
     ignored = []
     if call.name not in tool_specs.TOOL_NAMES:
@@ -303,8 +335,10 @@ def run_tool(call, session: Session, specs: list, cfg: dict) -> tuple[dict, str,
         args = {k: v for k, v in call.input.items() if k in allowed}
         ignored = sorted(set(call.input) - allowed)
         args.update(cfg.get("hidden_args", {}).get(call.name, {}))
-        args["now"] = session.now
+        args["now"] = now
         result = tools.TOOLS[call.name](**args)
+        if live:
+            mark_live(result)
     result, trimmed = fit_result(result, cfg["tool_result_max_kb"])
     text = to_json(result)
     entry = {"name": call.name, "input": call.input, "ms": round((time.perf_counter() - t0) * 1000),
@@ -366,6 +400,29 @@ def known_numbers(question: str, system: str) -> set[str]:
     return numbers_in(question) | numbers_in(prompt)
 
 
+SERVICE_PREFIXES = ("Дивився:", "Момент:", "⚠ дані застарілі", "⚠ відповідь без даних", "[система:")
+
+
+def strip_service_lines(text: str) -> str:
+    """Прибрати з тексту LLM службові рядки, які вона скопіювала з історії
+    («Дивився: …», «Момент: …», «⚠ дані застарілі …»): їх додає лише код."""
+    kept = [line for line in (text or "").split("\n") if not line.strip().startswith(SERVICE_PREFIXES)]
+    return "\n".join(kept).strip()
+
+
+def history_seen(seen: str | None) -> str:
+    """Рядок «Дивився» для історії — у формі, яку модель не візьме за зразок
+    для свого тексту: «[система: дивився стан (sim-1)]»."""
+    if not seen:
+        return ""
+    return "\n[система: дивився " + seen.removeprefix("Дивився: ") + "]"
+
+
+def live_label(now: str) -> str:
+    """Мітка часу репліки в живому режимі: «[21.11 10:15]» (з датою — розмова може йти через північ)."""
+    return f"[{short(now)}]"
+
+
 def seen_line(calls: list) -> str | None:
     """«Дивився: прогноз диска (sim-2, E:); ріст тек (sim-2, E:)» — людські назви функцій."""
     labels = []
@@ -417,11 +474,19 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
     effort = session.effort or cfg["effort"]
     t0 = time.perf_counter()
 
+    # «Зараз» цього питання фіксуємо ОДИН раз: промпт і всі функції бачать той самий
+    # момент (у живому режимі інакше дві функції могли б узяти різні хвилини)
+    live = session.now is None
+    q_now = session.now or show(local_now())
+
     servers = tools.list_servers().get("servers", [])
-    system = build_system_prompt(session.now, servers)
+    system = build_system_prompt(session.now, servers, clock=as_local(q_now) if live else None)
     specs = tool_specs.build_specs(servers)
-    # Після зміни моменту — службова примітка перед питанням (лише якщо розмова вже була)
-    user_text = f"{session.moment_note}\n{question}" if session.moment_note else question
+    # Після зміни моменту — службова примітка перед питанням (лише якщо розмова вже була).
+    # У живому режимі кожна репліка має мітку часу: числа з історії — на її час
+    user_text = f"{live_label(q_now)} {question}" if live else question
+    if session.moment_note:
+        user_text = f"{session.moment_note}\n{user_text}"
     messages = history_window(session.history, cfg["history_messages"]) + \
         [{"role": "user", "content": user_text}]
 
@@ -452,7 +517,7 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
             messages.append({"role": "assistant", "content": reply.content})
             blocks = []
             for call in reply.tool_calls:
-                result, text, entry = run_tool(call, session, specs, cfg)
+                result, text, entry = run_tool(call, q_now, live, specs, cfg)
                 calls.append(entry)
                 results.append(result)
                 blocks.append({"type": "tool_result", "tool_use_id": call.id, "content": text,
@@ -461,7 +526,9 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
     except LLMError as e:
         error, llm_text = str(e), str(e)
 
-    # Службові рядки — код, а не LLM
+    # Службові рядки пише лише код: якщо модель скопіювала їх з історії — вирізаємо
+    if not error:
+        llm_text = strip_service_lines(llm_text) or llm_text
     lines = []
     stale = stale_line(results)
     if stale:
@@ -475,20 +542,21 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
         lines.append(f"Момент: {short(session.now)} (історія)")
     text = llm_text + ("\n\n" + "\n".join(lines) if lines else "")
 
-    # Історія — лише текст (без JSON функцій) + «Дивився: …», щоб «а на D:?» знало сервер
-    # Примітка про зміну моменту лишається в історії разом із питанням
+    # Історія — лише текст (без JSON функцій) + «[система: дивився …]», щоб «а на D:?»
+    # знало сервер; у формі, яку модель не копіює у свій текст.
+    # Примітка про зміну моменту і мітка часу лишаються в історії разом із питанням
     if not error:
         session.history += [{"role": "user", "content": user_text},
-                            {"role": "assistant", "content": llm_text + (f"\n{seen}" if seen else "")}]
+                            {"role": "assistant", "content": llm_text + history_seen(seen)}]
         session.history = session.history[-cfg["history_messages"]:]
         session.moment_note = None
 
     answer = Answer(text=text, llm_text=llm_text, service_lines=lines, tool_calls=calls,
                     tool_results=results, llm_calls=llm_calls, tokens_in=tokens_in, tokens_out=tokens_out,
                     ms_total=round((time.perf_counter() - t0) * 1000), stale=bool(stale), error=error,
-                    moment=session.now, model=model, effort=effort)
+                    moment=q_now, model=model, effort=effort, live=live)
     write_log({"ts": pd.Timestamp.now(tz="UTC").strftime(tools.TS_FORMAT), "source": session.source,
-               "user": session.user, "moment": session.now, "model": model, "effort": effort,
+               "user": session.user, "moment": q_now, "live": live, "model": model, "effort": effort,
                "mode": session.mode, "question": question,
                "moment_note": user_text != question, "tool_calls": calls, "llm_calls": llm_calls,
                "tokens_in": tokens_in, "tokens_out": tokens_out, "ms_total": answer.ms_total,
