@@ -218,6 +218,44 @@ def test_system_prompt_moment(db):
     assert "Зараз: вівторок, 10.11.2026 08:00" in live and A.MOMENT_NOTE not in live
 
 
+def test_moment_change_note(db):
+    """Після /now код додає примітку «Момент змінено: тепер …» до наступного питання;
+    вона лишається в історії; без попередньої розмови примітки немає."""
+    s = A.Session(now=MOMENT)
+    A.set_moment(s, local(D + 120))                       # історії ще немає — примітки теж
+    assert s.moment_note is None
+    A.ask("Коли заповниться C:?", s, chat_fn=FakeLLM(reply("Через 2 доби.")))
+    A.set_moment(s, local(D + 180))
+    fake = FakeLLM(reply("Тепер інакше."))
+    A.ask("А зараз?", s, chat_fn=fake)
+    last = fake.requests[0]["messages"][-1]["content"]
+    assert "Момент змінено: тепер вівторок, 06.01.2026 05:00" in last and last.endswith("\nА зараз?")
+    assert s.history[2]["content"] == last and s.moment_note is None   # у історії; лише один раз
+    fake = FakeLLM(reply("ок"))
+    A.ask("ще?", s, chat_fn=fake)
+    assert fake.requests[0]["messages"][-1]["content"] == "ще?"
+    A.set_moment(s, None)                                  # живий режим
+    assert "тепер живий режим" in s.moment_note
+
+
+def test_server_role_only():
+    """У промпт — лише роль з опису (до двокрапки): розкладу й назви бази в даних немає."""
+    servers = [{"name": "sim-2", "description": "Сервер БД: SQL Server, база AppDb, нічний бекап о 02:00",
+                "disks": ["E:"], "services": [{"name": "MSSQLSERVER", "kind": "service"}]}]
+    text = A.servers_text(servers)
+    assert text.startswith("- sim-2 — Сервер БД; диски: E:; служби: MSSQLSERVER")
+    assert "02:00" not in text and "AppDb" not in text
+    assert A.server_role(None) == "без опису" and A.server_role("тестовий") == "тестовий"
+
+
+def test_prompt_rules():
+    """Правила зупинки 1 є в промпті."""
+    p = A.PROMPT_PATH.read_text(encoding="utf-8")
+    for rule in ("десятковий роздільник — кома", "Не порівнюй числа словами", "виклич її сам",
+                 "Не називай користувачу назв функцій"):
+        assert rule in p
+
+
 def test_parse_moment(db):
     """Зсуви, live, дата; раніше за дані і майбутнє — помилка; пізніше за дані — з попередженням."""
     servers = tools.list_servers()["servers"]

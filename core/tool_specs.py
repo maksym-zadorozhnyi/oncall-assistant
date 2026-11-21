@@ -83,13 +83,15 @@ def build_specs(servers: list | None = None) -> list[dict]:
             "top": {"type": "integer", "minimum": 1,
                     "description": "скільки процесів; не вказуйте — 5 (у знімку їх до 10)"},
             "at": {"type": "string",
-                   "description": f"час знімка в минулому, {TIME_NOTE}; не пізніше «зараз»; "
+                   "description": f"будь-який час у минулому, {TIME_NOTE}; не пізніше «зараз»; "
                                   f"наприклад, що вантажило CPU вчора о 14:00 — at = вчорашня дата 14:00; "
-                                  f"не вказуйте — «зараз»"}}, ["server"]),
+                                  f"береться останній знімок до at (знімки раз на 5 хв; давніший за "
+                                  f"10 хв до at — помилка); не вказуйте — «зараз»"}}, ["server"]),
         "get_folder_growth": ({
             "server": server,
             "period_h": {"type": "number", "minimum": 1,
-                         "description": "за скільки годин до «зараз»; не вказуйте — 24 (тиждень — 168)"},
+                         "description": "за скільки годин до «зараз»; не вказуйте — 24: так і для "
+                                        "«що росте зараз»; 168 — лише коли питають про тиждень"},
             "drive": drive}, ["server"]),
         "get_disk_forecast": ({"server": server, "drive": drive}, ["server"]),
         "get_timeline": ({

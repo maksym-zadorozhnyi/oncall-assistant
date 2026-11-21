@@ -68,6 +68,7 @@ class Session:
     effort: str | None = None          # None — з assistant.yaml
     mode: str = "tools"                # етап 3 додасть режими «без даних» і «сирі дані»
     user: str | None = None            # хто питає (Telegram ID) — лише для журналу
+    moment_note: str | None = None     # «Момент змінено: …» — додається до наступного питання в історії
 
 
 @dataclass
@@ -155,18 +156,48 @@ def parse_moment(text: str, current: str | None, servers: list | None = None) ->
     return show(t), warning
 
 
+def moment_text(moment: str | None) -> str:
+    """Момент людською мовою: «середа, 11.11.2026 08:00 (момент в історії)»."""
+    if moment is None:
+        return f"живий режим (зараз {local_now().strftime('%d.%m.%Y %H:%M')})"
+    t = as_local(moment)
+    return f"{WEEKDAYS[t.weekday()]}, {t.strftime('%d.%m.%Y %H:%M')} (момент в історії)"
+
+
+def set_moment(session: Session, moment: str | None) -> None:
+    """Змінити момент сесії (/now у консолі, /moment у боті).
+    Якщо розмова вже була, LLM має знати, що попередні відповіді — на інший момент:
+    код додає примітку до наступного питання в історії (так чергування реплік
+    user / assistant не порушується)."""
+    if moment == session.now:
+        return
+    session.now = moment
+    if session.history:
+        session.moment_note = (f"[Службова примітка. Момент змінено: тепер {moment_text(moment)}. "
+                               f"Попередні відповіді були на попередній момент і не є помилкою.]")
+
+
 # ---------------------------------------------------------------------------
 # Системний промпт
 # ---------------------------------------------------------------------------
 
+def server_role(description: str | None) -> str:
+    """Роль сервера з опису — лише частина до двокрапки («Сервер БД: SQL Server, база …,
+    нічний бекап о 02:00» -> «Сервер БД»). Решта опису — те, чого немає в даних (розклад,
+    назва бази): LLM подавала б це як факт, тож у промпт не беремо."""
+    role = (description or "").split(":")[0].strip()
+    return role or "без опису"
+
+
 def servers_text(servers: list) -> str:
-    """Сервери для промпту — лише статичне: назва, опис, диски, служби, пули, сайти.
-    (data_age_h і stale з list_servers рахуються за справжнім годинником — у промпт не беремо.)"""
+    """Сервери для промпту — лише статичне і те, що є в даних: назва, роль, диски, служби,
+    пули, сайти. (data_age_h і stale з list_servers рахуються за справжнім годинником —
+    у промпт не беремо.)"""
     lines = []
     for s in servers:
         svc = [x["name"] for x in s.get("services", []) if x.get("kind") == "service"]
         pools = [x["name"] for x in s.get("services", []) if x.get("kind") == "apppool"]
-        parts = [f"- {s['name']} — {s.get('description') or 'без опису'}",
+        parts = [f"- {s['name']} — {server_role(s.get('description'))}",
                  f"диски: {', '.join(s.get('disks', [])) or 'немає даних'}"]
         if svc:
             parts.append(f"служби: {', '.join(svc)}")
@@ -389,8 +420,10 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
     servers = tools.list_servers().get("servers", [])
     system = build_system_prompt(session.now, servers)
     specs = tool_specs.build_specs(servers)
+    # Після зміни моменту — службова примітка перед питанням (лише якщо розмова вже була)
+    user_text = f"{session.moment_note}\n{question}" if session.moment_note else question
     messages = history_window(session.history, cfg["history_messages"]) + \
-        [{"role": "user", "content": question}]
+        [{"role": "user", "content": user_text}]
 
     calls, results = [], []
     llm_calls = tokens_in = tokens_out = 0
@@ -443,10 +476,12 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
     text = llm_text + ("\n\n" + "\n".join(lines) if lines else "")
 
     # Історія — лише текст (без JSON функцій) + «Дивився: …», щоб «а на D:?» знало сервер
+    # Примітка про зміну моменту лишається в історії разом із питанням
     if not error:
-        session.history += [{"role": "user", "content": question},
+        session.history += [{"role": "user", "content": user_text},
                             {"role": "assistant", "content": llm_text + (f"\n{seen}" if seen else "")}]
         session.history = session.history[-cfg["history_messages"]:]
+        session.moment_note = None
 
     answer = Answer(text=text, llm_text=llm_text, service_lines=lines, tool_calls=calls,
                     tool_results=results, llm_calls=llm_calls, tokens_in=tokens_in, tokens_out=tokens_out,
@@ -454,7 +489,8 @@ def ask(question: str, session: Session, chat_fn=None, cfg: dict | None = None) 
                     moment=session.now, model=model, effort=effort)
     write_log({"ts": pd.Timestamp.now(tz="UTC").strftime(tools.TS_FORMAT), "source": session.source,
                "user": session.user, "moment": session.now, "model": model, "effort": effort,
-               "mode": session.mode, "question": question, "tool_calls": calls, "llm_calls": llm_calls,
+               "mode": session.mode, "question": question,
+               "moment_note": user_text != question, "tool_calls": calls, "llm_calls": llm_calls,
                "tokens_in": tokens_in, "tokens_out": tokens_out, "ms_total": answer.ms_total,
                "stale": answer.stale, "answer": text, "error": error})
     return answer
@@ -546,13 +582,15 @@ def main() -> None:
                 break
             if cmd == "/reset":
                 session.history = []
+                session.moment_note = None
                 print("Історію розмови очищено.")
             elif cmd == "/now":
                 if not rest.strip():
                     print(moment_header(session.now, session.model or cfg["model"], session.effort or cfg["effort"]))
                     continue
                 try:
-                    session.now, warning = parse_moment(rest, session.now)
+                    moment, warning = parse_moment(rest, session.now)
+                    set_moment(session, moment)       # + примітка в історії, якщо розмова вже була
                 except MomentError as e:
                     print(f"Помилка: {e}")
                     continue

@@ -206,6 +206,63 @@ def test_late_forecast_not_for_now(db):
         d["to_threshold_pp"], abs=0.2)                                   # диск 100 ГБ: 1 п. п. = 1 ГБ
 
 
+def test_forecast_threshold_time(db):
+    """Час досягнення порогу рахує код: now + hours_to_threshold, місцевим часом."""
+    now = local(D + 60)
+    tr = tools.get_disk_forecast("t-1", drive="C:", now=now)["disks"][0]["trend"]
+    expected = (pd.Timestamp(now) + pd.Timedelta(hours=tr["hours_to_threshold"])).floor("min")
+    # hours_to_threshold округлено до 0,1 год — допуск 6 хв
+    got = pd.Timestamp(tr["threshold_at_local"])
+    assert abs((got - expected).total_seconds()) <= 360
+
+
+def test_jump_crosses_threshold():
+    """Регулярний стрибок сам переводить диск через 90 %: коли і чи раніше за пряму тренду."""
+    now = pd.Timestamp("2026-01-06T00:00:00Z")
+    cfg = fc.load_config()
+    jump = {"found": True, "at": now + pd.Timedelta(hours=2), "hours_until": 2.0, "size_gb": 10.0,
+            "days_seen": 7, "free_at_gb": 15.0, "fits": True, "short_gb": 0.0,
+            "free_to_stay_below_gb": 5.0, "level_after_pct": 95.0, "text": "поміститься"}
+
+    def answer(hours):
+        r = {"trend": {"status": "ok" if hours else "мало даних", "start": now, "points": 10,
+                       "hours_to_threshold": hours, "speed_pct_day": 1.0, "speed_gb_day": 1.0,
+                       "pred": {24: (86, 85, 87), 168: (92, 90, 94)}},
+             "fast_growth": {"status": "мало даних"}, "jump": jump, "now_pct": 85.0, "now_free_gb": 15.0}
+        return tools.disk_answer("C:", r, now, cfg, False, now - pd.Timedelta(days=14))
+
+    early = answer(10.0)                     # пряма — через 10 год, стрибок — через 2 год
+    assert early["trend"]["threshold_at_local"] == tools.loc(now + pd.Timedelta(hours=10))
+    assert early["jump"]["crosses_threshold"] is True and early["jump"]["crosses_before_trend"] is True
+    assert "раніше, ніж за прямою тренду" in early["notes"][0]
+    late = answer(1.0)                       # пряма — раніше за стрибок
+    assert late["jump"]["crosses_before_trend"] is False and "пізніше" in late["notes"][0]
+    none = answer(None)                      # прямої немає — стрибок перший
+    assert none["trend"]["threshold_at_local"] is None and none["jump"]["crosses_before_trend"] is True
+    jump["level_after_pct"] = 88.0           # після стрибка нижче 90 % — не перетинає
+    assert answer(10.0)["jump"]["crosses_threshold"] is False and answer(10.0)["notes"] == []
+
+
+def test_folder_growth_drops(db):
+    """Різке видалення всередині періоду: коли, скільки, і ріст після нього."""
+    from core.db import db_session
+    with db_session(db) as conn:                 # C:\Tmp: 20 ГБ +1 ГБ/год, о D+300 видалено 15 ГБ
+        rows = []
+        for i in range(D, D + 601, 60):
+            size = 20 + (i - D) / 60 - (15 if i >= D + 300 else 0)
+            rows.append((ts(i, 2), "C:\\Tmp", size))
+        conn.executemany("INSERT INTO folder_sizes VALUES (?, 1, ?, ?)", rows)
+    r = tools.get_folder_growth("t-1", period_h=10, now=local(D + 600))
+    f = next(x for x in r["folders"] if x["path"] == "C:\\Tmp")
+    assert f["growth_gb"] == -5.0                                  # «кінець − початок» ховає ріст
+    assert f["drops"] == [{"at_local": local(D + 300), "freed_gb": 14.0,
+                           "size_before_gb": 24.0, "size_after_gb": 10.0}] and f["drops_total"] == 1
+    assert f["since_last_drop"] == {"from_local": local(D + 300), "growth_gb": 5.0, "measured_h": 5.0,
+                                    "growth_gb_per_day": 24.0}
+    logs = next(x for x in r["folders"] if x["path"] == "C:\\Logs")
+    assert "drops" not in logs                                     # рівний ріст — без видалень
+
+
 def test_history_gap_imputed_outliers(db):
     """Пропуск знаходиться; заповнені точки і викиди рахуються; після now — нічого."""
     r = tools.get_metric_history("t-1", "cpu_pct", start=local(D), end=local(D + 180), now=local(D + 150))

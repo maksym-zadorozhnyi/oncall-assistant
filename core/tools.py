@@ -544,8 +544,11 @@ def get_top_processes(server: str, now: str | None = None, by: str = "cpu", top:
     Коли викликати: «Хто вантажить CPU на sim-1?», «Хто їсть пам'ять?», «чого sim-1 тупить?»,
     «який пул жере проц?», «Чому гальмує сервер?» (разом зі станом); з at — «що вантажило
     CPU вчора о 14:00» (спершу знайди час піку через get_metric_history, потім at = цей час).
-    Не вміє: час пізніше за «зараз» (помилка); період — лише один знімок, останній до at
-    (не давніший за 10 хв; інакше — помилка «немає знімка»); історію CPU (get_metric_history).
+    at — будь-який час у минулому (вчора, тиждень тому), не лише останні хвилини;
+    береться останній знімок не пізніше at. 10 хв — лише межа давності знімка: якщо
+    найближчий знімок до at давніший за 10 хв — помилка «немає знімка».
+    Не вміє: час пізніше за «зараз» (помилка); період — лише один знімок за виклик
+    (для кількох моментів — кілька викликів); історію CPU (get_metric_history).
     Повертає: snapshot_local (час знімка), cpu_server і ram_server_pct (CPU і RAM сервера
     в ту хвилину — щоб порівняти з процесом), processes: name, pid, cpu_pct (0–100 % від
     усього CPU), ram_mb, app_pool (для w3wp.exe), service (служба, якщо цей exe належить
@@ -616,6 +619,34 @@ def free_at(conn, server_id: int, drive: str, t: pd.Timestamp):
     return r[0] if r else None
 
 
+DROP_MIN_GB = 1.0          # різке видалення: тека зменшилась щонайменше на 1 ГБ
+DROP_MIN_SHARE = 0.05      # ... і щонайменше на 5 % між сусідніми знімками
+
+
+def folder_drops(conn, server_id: int, path: str, ts0: str, t: pd.Timestamp) -> list[dict]:
+    """Різкі видалення в теці між знімком ts0 і now: коли, скільки звільнено.
+    Кілька спадів поспіль (знімки раз на 5 хв) — одне видалення."""
+    rows = conn.execute("SELECT ts, size_gb FROM folder_sizes WHERE server_id = ? AND path = ? "
+                        "AND ts >= ? AND ts < ? ORDER BY ts", (server_id, path, ts0, cutoff(t))).fetchall()
+    drops, prev, current = [], None, None
+    for r in rows:
+        if prev is not None:
+            fall = prev["size_gb"] - r["size_gb"]
+            if fall >= DROP_MIN_GB and fall >= DROP_MIN_SHARE * prev["size_gb"]:
+                if current is None:
+                    current = {"from_ts": prev["ts"], "size_before_gb": prev["size_gb"]}
+                current.update(ts=r["ts"], size_after_gb=r["size_gb"])
+            elif current is not None:
+                drops.append(current)
+                current = None
+        prev = r
+    if current is not None:
+        drops.append(current)
+    return [{"at_local": loc(d["ts"]), "freed_gb": num(d["size_before_gb"] - d["size_after_gb"]),
+             "size_before_gb": num(d["size_before_gb"]), "size_after_gb": num(d["size_after_gb"]),
+             "_ts": d["ts"]} for d in drops]
+
+
 @tool
 def get_folder_growth(server: str, period_h: float = 24, drive: str | None = None,
                       now: str | None = None) -> dict:
@@ -626,8 +657,14 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
     get_timeline).
     Не вміє: окремі файли (агент знає лише розмір відстежуваних тек); прогноз
     (get_disk_forecast); що буде після прибирання.
+    Для «що росте зараз», «чого пухне» — період за замовчуванням (24 год); тиждень —
+    лише коли питають про тиждень.
     Повертає: folders — по кожній теці size_start_gb, size_now_gb, growth_gb,
-    growth_gb_per_day (від найбільшого росту); disks — по кожному диску growth_gb (ріст
+    growth_gb_per_day (від найбільшого росту; це «кінець − початок»: різкі видалення
+    всередині періоду його зменшують); якщо в періоді були різкі видалення — drops
+    (at_local, freed_gb — скільки звільнено) і since_last_drop (ріст після останнього
+    видалення: growth_gb, growth_gb_per_day — це і є швидкість росту зараз);
+    disks — по кожному диску growth_gb (ріст
     зайнятого місця зі зміни вільного), folders_gb (сума тек) і other_gb (росте щось
     поза відстежуваними теками).
 
@@ -670,9 +707,22 @@ def get_folder_growth(server: str, period_h: float = 24, drive: str | None = Non
                 notes.append(f"{path}: дані лише з {loc(ts0)}")
             hours = (parse_db(ts1) - parse_db(ts0)).total_seconds() / 3600
             growth = size1 - size0
-            folders.append({"path": path, "drive": d, "size_start_gb": num(size0), "size_now_gb": num(size1),
-                            "growth_gb": num(growth), "measured_h": num(hours, 1),
-                            "growth_gb_per_day": num(growth / hours * 24) if hours > 0 else None})
+            item = {"path": path, "drive": d, "size_start_gb": num(size0), "size_now_gb": num(size1),
+                    "growth_gb": num(growth), "measured_h": num(hours, 1),
+                    "growth_gb_per_day": num(growth / hours * 24) if hours > 0 else None}
+            # Різкі видалення всередині періоду: «кінець − початок» їх ховає,
+            # тому окремо — коли і скільки, і ріст після останнього з них
+            drops = folder_drops(conn, s["id"], path, ts0, t)
+            if drops:
+                last_drop = drops[-1]
+                h = (parse_db(ts1) - parse_db(last_drop["_ts"])).total_seconds() / 3600
+                g = size1 - last_drop["size_after_gb"]
+                item["drops"] = [{k: v for k, v in x.items() if k != "_ts"} for x in drops[-5:]]
+                item["drops_total"] = len(drops)
+                item["since_last_drop"] = {"from_local": last_drop["at_local"], "growth_gb": num(g),
+                                           "measured_h": num(h, 1),
+                                           "growth_gb_per_day": num(g / h * 24) if h > 0 else None}
+            folders.append(item)
         folders.sort(key=lambda x: x["growth_gb"] or 0, reverse=True)
         disks = []
         for d in sorted({f["drive"] for f in folders} |
@@ -710,6 +760,13 @@ def trend_line(tr: dict, now: pd.Timestamp) -> list:
     return out
 
 
+def threshold_time(now: pd.Timestamp, hours) -> pd.Timestamp | None:
+    """Момент досягнення порогу: now + години (0 — уже вище, тобто now; None — не досягне)."""
+    if hours is None:
+        return None
+    return (now + pd.Timedelta(hours=float(hours))).floor("min")
+
+
 def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bool,
                 history_start: pd.Timestamp) -> dict:
     tr, fg, j = r["trend"], r["fast_growth"], r["jump"]
@@ -739,6 +796,12 @@ def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bo
                        "usual_max_pct_per_h": num(fg["usual_pct_h"]), "limit_pct_per_h": num(fg["limit_pct_h"]),
                        "unusual": fg["unusual"], "in_1h": level(fg["pred"][1]),
                        "hours_to_threshold": num(fg["hours_to_threshold"], 1)})
+    thr, used, free = cfg["threshold_pct"], r["now_pct"], r["now_free_gb"]
+    # Коли пряма тренду (і швидкий ріст) дійде до порогу — час рахує код, а не LLM
+    trend_at = threshold_time(now, tr.get("hours_to_threshold"))
+    trend_out["threshold_at_local"] = loc(trend_at)
+    if fg.get("status") == "ok":
+        fg_out["threshold_at_local"] = loc(threshold_time(now, fg["hours_to_threshold"]))
     if j["found"]:
         j_out = {"found": True, "next_local": loc(j["at"]), "hours_until": num(j["hours_until"], 1),
                  "size_gb": num(j["size_gb"], 1), "days_seen": j["days_seen"],
@@ -746,10 +809,19 @@ def disk_answer(drive: str, r: dict, now: pd.Timestamp, cfg: dict, with_line: bo
                  "fits": j["fits"], "short_gb": num(j["short_gb"], 1),
                  "free_to_stay_below_gb": num(j["free_to_stay_below_gb"], 1),
                  "level_after_pct": num(j["level_after_pct"], 1), "text": j["text"]}
+        # Стрибок сам переведе диск через поріг (зараз нижче, після стрибка — вище)?
+        crosses = bool(used < thr and j["level_after_pct"] is not None and j["level_after_pct"] >= thr)
+        j_out["crosses_threshold"] = crosses
+        if crosses:
+            earlier = trend_at is None or j["at"] < trend_at
+            j_out["crosses_before_trend"] = earlier
+            notes.append(f"поріг {thr} % перетне регулярний стрибок {loc(j['at'])} (після нього "
+                         f"{j['level_after_pct']:.1f} %) — " +
+                         ("раніше, ніж за прямою тренду" if earlier else
+                          f"пізніше, ніж за прямою тренду ({loc(trend_at)})"))
     else:
         j_out = {"found": False, "text": j["text"]}
     # Відстань до порогу: у п. п. і в ГБ (розмір диска = вільно / (1 − зайнято))
-    thr, used, free = cfg["threshold_pct"], r["now_pct"], r["now_free_gb"]
     total = free / (1 - used / 100) if used < 99.9 else None
     out = {"drive": drive, "now_pct": num(used, 1), "now_free_gb": num(free, 1),
            "to_threshold_pp": num(thr - used, 1),
@@ -774,12 +846,14 @@ def get_disk_forecast(server: str, drive: str | None = None, now: str | None = N
       скільки погодинних точок у прямій; якщо їх менше за min_points — status «мало даних»,
       прямої немає): pct_per_day, gb_per_day,
       рівень in_24h і in_7d з інтервалом 10–90 % (low–high), hours_to_threshold
-      (годин до порогу; 0 — вже вище; null — не досягне);
+      (годин до порогу; 0 — вже вище; null — не досягне) і threshold_at_local — коли саме
+      (місцевий час; бери його, не додавай години сам);
     - fast_growth — ріст за останні 90 хв: pct_per_h, звичайний максимум у ці хвилини
-      доби за 7 днів, unusual (чи швидший за межу), hours_to_threshold;
+      доби за 7 днів, unusual (чи швидший за межу), hours_to_threshold, threshold_at_local;
     - jump — регулярний стрибок (напр. щоденний бекап): next_local, size_gb, free_then_gb,
       fits (поміститься), short_gb (фізично бракує), free_to_stay_below_gb (скільки звільнити,
-      щоб лишитися нижче порогу).
+      щоб лишитися нижче порогу), level_after_pct, crosses_threshold (стрибок сам переведе
+      диск через поріг), crosses_before_trend (це станеться раніше, ніж за прямою тренду).
     threshold_pct — поріг (90 %); to_threshold_pp і to_threshold_gb — скільки лишилось до порогу.
     Якщо даних свіжих немає (stale) — прогнозу на «зараз» немає (disks відсутнє), а
     forecast_at_last_data — прогноз на момент останніх даних, НЕ на зараз.
